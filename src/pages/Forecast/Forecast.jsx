@@ -32,6 +32,56 @@ const shortDate = (s) => (s ? String(s).slice(0, 10) : '—')
 // Status colouring now lives in the shared <StatusBadge>, so OK / UNDER / OVER /
 // UNRELIABLE read identically here and anywhere else they appear.
 
+/**
+ * One predicted-volume block: total energy, the days it covers, and whether
+ * the backtest actually measured that horizon.
+ *
+ * The validated/unvalidated badge sits on the card rather than in a footnote
+ * below, because the number is what gets read aloud in a meeting and the
+ * caveat has to travel with it. A block the run could not fill reports how
+ * many days it does cover instead of quietly summing fewer and calling it a
+ * month.
+ */
+function HorizonCard({ label, h, fallback = null }) {
+  const total = h?.total_mwh ?? null
+  const shown = total != null ? fmt(total) : (fallback ?? '—')
+
+  return (
+    <div className="kpi-card">
+      <div className="flex items-start justify-between gap-2 mb-1.5">
+        <span className="font-mono text-[10px] text-ge-text3 uppercase tracking-widest">
+          {label}
+        </span>
+        {h && (
+          <StatusBadge tone={h.validated ? 'green' : 'neutral'}>
+            {h.validated ? 'VALIDATED' : 'UNVALIDATED'}
+          </StatusBadge>
+        )}
+      </div>
+
+      <div className="font-mono text-[22px] font-semibold text-ge-text1 leading-none mb-1.5">
+        {shown}
+        <span className="text-[12px] text-ge-text3 ml-1">MWh</span>
+      </div>
+
+      {h && total != null && (
+        <div className="text-[10px] font-mono text-ge-text3 leading-relaxed space-y-0.5">
+          <div>{shortDate(h.start)} → {shortDate(h.end)}</div>
+          <div>{fmt(h.mean_daily_mwh)} MWh/day average</div>
+          {h.lower_mwh != null && (
+            <div>range {fmt(h.lower_mwh)} – {fmt(h.upper_mwh)}</div>
+          )}
+          {!h.complete && (
+            <div className="text-amber-400">
+              only {h.days_available} of {h.days_requested} days predicted
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Forecast() {
   const { activeSite } = useApp()
   const [status, setStatus]       = useState(null)
@@ -95,6 +145,9 @@ export default function Forecast() {
   const run   = latest?.available ? latest : null
   const rel   = nextDay?.reliability || run?.reliability
   const met   = !!run?.target_met
+  // Next-day / 7-day / 30-day blocks, summed server-side from the forward
+  // predictions. Absent until a run exists, so every read is guarded.
+  const H     = nextDay?.horizons || {}
   const chart = (history?.points || []).map(p => ({
     date: shortDate(p.date),
     actual: p.actual_mwh,
@@ -139,11 +192,20 @@ export default function Forecast() {
         </div>
       )}
 
-      {/* ── headline numbers ─────────────────────────────────────────────── */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
-        <KpiCard label="Next day forecast"
-                 value={nextDay?.available ? fmt(nextDay.predicted_mwh) : '—'}
-                 unit="MWh" color="blue" />
+      {/* ── predicted volumes: next day, week, month ─────────────────────── */}
+      {/* Kept separate from the accuracy figures below, because they answer
+          different questions: how much energy to expect, versus how far the
+          model has earned trust. Only the next-day figure is measured by the
+          backtest, and each card says which it is. */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+        <HorizonCard label="Next day" h={H.next_day}
+                     fallback={nextDay?.available ? fmt(nextDay.predicted_mwh) : null} />
+        <HorizonCard label="Next 7 days" h={H.next_7_days} />
+        <HorizonCard label="Next 30 days" h={H.next_30_days} />
+      </div>
+
+      {/* ── measured accuracy ────────────────────────────────────────────── */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
         <KpiCard label={`Forecast score (target ${fmt(run?.target_score_pct)}%)`}
                  value={run ? fmt(run.score_pct, 1) : '—'} unit="%"
                  color={met ? 'green' : 'amber'} />
