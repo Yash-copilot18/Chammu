@@ -2,9 +2,11 @@
 
 import pyodbc
 import urllib
+from functools import lru_cache
+from typing import Optional
+
 from pydantic_settings import BaseSettings
 from pydantic import Field
-from functools import lru_cache
 
 
 class DatabaseSettings(BaseSettings):
@@ -14,6 +16,19 @@ class DatabaseSettings(BaseSettings):
         default="ODBC Driver 17 for SQL Server",
         env="DB_DRIVER"
     )
+
+    # SQL Server Authentication, used only when DB_USERNAME is set.
+    #
+    # Windows Authentication remains the default and is the better choice where
+    # it is available: nothing has to be stored. But an instance configured for
+    # mixed mode and reached with a login such as `sa` cannot be opened with a
+    # trusted connection at all, and a deployment on a machine whose Windows
+    # account has no login on the server has no other route.
+    #
+    # The password is read from the environment and never written anywhere by
+    # this application. `.env` is git-ignored; keep it that way.
+    DB_USERNAME: Optional[str] = Field(default=None, env="DB_USERNAME")
+    DB_PASSWORD: Optional[str] = Field(default=None, env="DB_PASSWORD")
 
     model_config = {"env_file": ".env", "extra": "allow"}
 
@@ -25,19 +40,44 @@ def get_db_settings() -> DatabaseSettings:
 
 def build_connection_string() -> str:
     """
-    Build a pyodbc connection string using Windows Authentication
-    (Trusted_Connection=yes) — no username or password required.
+    Build a pyodbc connection string for the configured instance.
+
+    Windows Authentication by default — nothing to store, nothing to leak.
+    Setting DB_USERNAME switches to SQL Server Authentication, for an instance
+    in mixed mode that is reached with a login rather than a domain account.
+
+    The two are mutually exclusive in the string: sending both
+    Trusted_Connection=yes and UID/PWD lets the driver choose, and which one it
+    picks varies by version, so a connection that works on one machine fails on
+    the next. The branch here makes the choice explicit.
     """
     settings = get_db_settings()
 
-    connection_string = (
+    base = (
         f"DRIVER={{{settings.DB_DRIVER}}};"
         f"SERVER={settings.DB_SERVER};"
         f"DATABASE={settings.DB_DATABASE};"
-        f"Trusted_Connection=yes;"
         f"TrustServerCertificate=yes;"
     )
-    return connection_string
+
+    if settings.DB_USERNAME:
+        if not settings.DB_PASSWORD:
+            raise ValueError(
+                "DB_USERNAME is set but DB_PASSWORD is empty. SQL Server "
+                "Authentication needs both. Leave DB_USERNAME blank to use "
+                "Windows Authentication instead."
+            )
+        return base + f"UID={settings.DB_USERNAME};PWD={settings.DB_PASSWORD};"
+
+    return base + "Trusted_Connection=yes;"
+
+
+def describe_auth() -> str:
+    """How the connection authenticates, for the startup log. Never the password."""
+    settings = get_db_settings()
+    if settings.DB_USERNAME:
+        return f"SQL Server Authentication as '{settings.DB_USERNAME}'"
+    return "Windows Authentication"
 
 
 def build_sqlalchemy_url() -> str:

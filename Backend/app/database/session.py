@@ -79,7 +79,13 @@ def verify_database_connection() -> bool:
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        logger.info("Database connection verified successfully.")
+        # Name the auth mode: a connection that silently fell back to the
+        # wrong one is otherwise invisible until a permissions error much
+        # later. Never logs the password.
+        from app.database.connection import describe_auth, get_db_settings
+        _s = get_db_settings()
+        logger.info("Database connection verified successfully - %s on %s/%s via %s.",
+                    describe_auth(), _s.DB_SERVER, _s.DB_DATABASE, _s.DB_DRIVER)
         return True
     except Exception as e:
         logger.error(f"Database connection failed: {e}")

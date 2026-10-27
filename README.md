@@ -35,6 +35,25 @@ cd ..\Layout; npm install
 
 Neither `.env` is committed. Copy `.env.example` in each folder and fill it in.
 
+### Connecting to SQL Server
+
+`Backend/.env` needs `DB_SERVER` and `DB_DATABASE`. Authentication follows
+from whether you set a username:
+
+| | |
+|---|---|
+| Windows Authentication | leave `DB_USERNAME` and `DB_PASSWORD` blank |
+| SQL Server Authentication | set both |
+
+Windows auth is preferable wherever it works, because nothing has to be
+stored. An instance in mixed mode reached with a SQL login cannot be opened
+with a trusted connection at all, so on those machines the second row is not a
+preference. Prefer a least-privilege login scoped to this database over `sa`.
+
+The startup log names which mode was used, so a connection that opened a
+different way than intended is visible immediately rather than surfacing later
+as a permissions error.
+
 ---
 
 ## Scope
