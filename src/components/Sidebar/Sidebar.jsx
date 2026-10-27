@@ -6,25 +6,31 @@ import {
   MdBuild, MdNotifications, MdSchedule, MdPeople, MdSettings,
   MdChevronLeft, MdChevronRight, MdSatelliteAlt, MdShowChart, MdBolt, MdTune, MdTrendingUp } from 'react-icons/md'
 import { useApp } from '../../utils/AppContext'
+import { isPageEnabled } from '../../config/features'
 
-// `hidden: true` removes an item from the sidebar without deleting its route or
-// component — the page is still reachable by navigating directly to its URL.
+// Each item carries the `key` that config/features.js switches on. An item whose
+// page is not enabled for this deployment is left out of the sidebar AND has no
+// route registered, so its URL cannot be reached either — unlike `hidden: true`,
+// which only removed it from the menu.
+//
+// `hidden: true` is kept for pages that exist and work but are deliberately not
+// advertised; it is independent of the feature switch.
 const NAV_ITEMS = [
-  { label: 'Dashboard',         path: '/dashboard', icon: MdDashboard,     group: 'Operations'  },
-  { label: 'Reports',           path: '/reports',   icon: MdBarChart,      group: 'Operations'  },
-  { label: 'Tracker Reports',   path: '/tracker',   icon: MdSatelliteAlt,  group: 'Operations', hidden: true },
-  { label: 'Tracker Status',    path: '/tracker-status', icon: MdSatelliteAlt, group: 'Operations', hidden: true },
-  { label: 'DGR Reports',       path: '/dgr',       icon: MdAssignment,    group: 'Operations'  },
-  { label: 'Analytics',         path: '/analytics', icon: MdAnalytics,     group: 'Operations'  },
-  { label: 'Preconfigured Reports', path: '/preconfigured', icon: MdTune,   group: 'Operations'  },
-  { label: 'Generation Forecast', path: '/forecast', icon: MdTrendingUp,    group: 'Operations'  },
-  { label: 'PPC Trend',         path: '/ppc-trend', icon: MdShowChart,     group: 'Operations', hidden: true },
-  { label: 'Power Graph',       path: '/power-graph', icon: MdBolt,        group: 'Operations', hidden: true },
-  { label: 'Equipment',         path: '/equipment', icon: MdBuild,         group: 'Monitoring', hidden: true },
-  { label: 'Alarms',            path: '/alarms',    icon: MdNotifications, group: 'Monitoring', hidden: true },
-  { label: 'Scheduled Reports', path: '/scheduled', icon: MdSchedule,      group: 'Monitoring'  },
-  { label: 'User Management',   path: '/users',     icon: MdPeople,        group: 'Admin'       },
-  { label: 'Settings',          path: '/settings',  icon: MdSettings,      group: 'Admin', hidden: true },
+  { key: 'dashboard',     label: 'Dashboard',         path: '/dashboard',      icon: MdDashboard,     group: 'Operations' },
+  { key: 'reports',       label: 'Reports',           path: '/reports',        icon: MdBarChart,      group: 'Operations' },
+  { key: 'tracker',       label: 'Tracker Reports',   path: '/tracker',        icon: MdSatelliteAlt,  group: 'Operations', hidden: true },
+  { key: 'trackerStatus', label: 'Tracker Status',    path: '/tracker-status', icon: MdSatelliteAlt,  group: 'Operations', hidden: true },
+  { key: 'dgr',           label: 'DGR Reports',       path: '/dgr',            icon: MdAssignment,    group: 'Operations' },
+  { key: 'analytics',     label: 'Analytics',         path: '/analytics',      icon: MdAnalytics,     group: 'Operations' },
+  { key: 'preconfigured', label: 'Preconfigured Reports', path: '/preconfigured', icon: MdTune,       group: 'Operations' },
+  { key: 'forecast',      label: 'Generation Forecast', path: '/forecast',     icon: MdTrendingUp,    group: 'Operations' },
+  { key: 'ppcTrend',      label: 'PPC Trend',         path: '/ppc-trend',      icon: MdShowChart,     group: 'Operations', hidden: true },
+  { key: 'powerGraph',    label: 'Power Graph',       path: '/power-graph',    icon: MdBolt,          group: 'Operations', hidden: true },
+  { key: 'equipment',     label: 'Equipment',         path: '/equipment',      icon: MdBuild,         group: 'Monitoring', hidden: true },
+  { key: 'alarms',        label: 'Alarms',            path: '/alarms',         icon: MdNotifications, group: 'Monitoring', hidden: true },
+  { key: 'scheduled',     label: 'Scheduled Reports', path: '/scheduled',      icon: MdSchedule,      group: 'Monitoring' },
+  { key: 'users',         label: 'User Management',   path: '/users',          icon: MdPeople,        group: 'Admin' },
+  { key: 'settings',      label: 'Settings',          path: '/settings',       icon: MdSettings,      group: 'Admin', hidden: true },
 ]
 
 const GROUPS = ['Operations', 'Monitoring', 'Admin']
@@ -54,7 +60,8 @@ export default function Sidebar() {
       {/* Nav */}
       <nav className="flex-1 overflow-y-auto py-2">
         {GROUPS.map(group => {
-          const items = NAV_ITEMS.filter(i => i.group === group && !i.hidden)
+          const items = NAV_ITEMS.filter(
+            i => i.group === group && !i.hidden && isPageEnabled(i.key))
           if (items.length === 0) return null
           return (
           <div key={group} className="py-1">
