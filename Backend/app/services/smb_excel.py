@@ -1,0 +1,672 @@
+# app/services/smb_excel.py
+"""
+String Combiner (SMB) export — data access + per-inverter sheet production.
+
+Layout — ONE workbook per inverter, with ONE worksheet per String Combiner (SMB).
+Each inverter's columns are split by their SCB index onto their own tab, so every
+SMB reads as its own self-contained report (Timestamp + only that SMB's columns):
+
+    INV1.xlsx                 INV2.xlsx
+     ├── SMB1                   ├── SMB1
+     ├── SMB2                   ├── SMB2
+     │   …                      │   …
+     └── SMB21                  └── SMB18
+
+Every worksheet is built from row 1 by `report_excel.write_report_sheet_streaming`
+on a freshly created worksheet object: the same report title + equipment metadata
+block, one header row and its own SMB's data. No row index, style, print setting or
+worksheet state carries over between tabs.
+
+The columns come dynamically from the UI selection — there is no predefined column
+list. They are grouped onto tabs strictly by the SCB<n>_ prefix each column carries
+(the SMB count is whatever the inverter actually has), UI order preserved within
+each tab and no column ever dropped or reordered. Selected tags that do not exist in
+the table are logged as an ERROR and simply produce no column, so the exported
+columns always equal the selected tags that the inverter genuinely has.
+
+A single selected inverter returns its `INV{n}.xlsx`; several inverters return a ZIP
+of per-inverter workbooks (the SMB1/SMB2/… tab names would collide inside one
+combined workbook).
+
+Print layout: A4 landscape with the header row repeated down the pages and the
+Timestamp column repeated across them. A table this wide necessarily prints across
+many pages; scale-to-fit is not attempted because it would be illegible.
+
+Rendering is delegated to the shared `report_excel` service — this module only
+discovers/​fetches SCB columns and yields sheet-specs, so there is a SINGLE Excel
+code path across the whole Reports module.
+
+Performance: inverters are fetched CONCURRENTLY (lean query per table — only the
+required SCB columns, no COUNT, batched reads for large datasets). Each inverter is
+queried ONCE and that row set feeds all of its SMB sections; sheets stream into one
+XlsxWriter constant-memory workbook, so memory stays flat.
+"""
+
+import io
+import os
+import re
+import time
+import zipfile
+import logging
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from sqlalchemy import text
+
+from app.database.session import SessionLocal
+from app.repositories.reports_repository import (
+    EQUIPMENT_REGISTRY, _safe_name, _build_interval_expr,
+)
+from app.services import intervals
+
+# Rows fetched per DB round-trip; datasets larger than this are read in batches.
+_FETCH_BATCH = 20000
+_MAX_ROWS    = 200000        # hard safety cap to bound memory
+_TEXT_TYPES  = {"nvarchar", "varchar", "char", "nchar", "text", "ntext"}
+_MAX_WORKERS = 4             # concurrent inverter queries
+
+XLSX_CTYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+ZIP_CTYPE  = "application/zip"
+
+logger = logging.getLogger(__name__)
+
+_REG_TAGS = EQUIPMENT_REGISTRY.get("String Combiner", {}).get("tags", {})
+
+# Unit hints for SCB columns not present in the registry (e.g. extra string currents).
+_UNIT_HINTS = [
+    ("DC_POWER", "kW"), ("DC_VOLTAGE", "V"), ("INTERNAL_TEMP", "C"),
+    ("TOTAL_CURRENT", "A"), ("STRING_CURRENT", "A"), ("CURRENT", "A"),
+    ("VOLTAGE", "V"), ("POWER", "kW"), ("TEMP", "C"),
+]
+
+
+def _col_meta(col: str):
+    """Return (label, unit) for an SCB column."""
+    if col in _REG_TAGS:
+        return _REG_TAGS[col]["label"], _REG_TAGS[col]["unit"]
+    label = col.replace("_", " ").title()
+    unit = ""
+    for key, u in _UNIT_HINTS:
+        if key in col:
+            unit = u
+            break
+    return label, unit
+
+
+def _col_header(col: str) -> str:
+    if col == "timestamp":
+        return "Timestamp (DD/MM/YYYY HH:MM:SS)"
+    label, unit = _col_meta(col)
+    return f"{label} ({unit})" if unit else label
+
+
+def sheet_name_for(table: str) -> str:
+    """INVERTER1_SMB -> INV1 (Excel sheet names are capped at 31 chars)."""
+    m = re.match(r"INVERTER0*(\d+)_SMB", table, re.IGNORECASE)
+    return f"INV{m.group(1)}" if m else table[:31]
+
+
+def _inv_no(table: str) -> str:
+    """INVERTER1_SMB -> '1'."""
+    m = re.match(r"INVERTER0*(\d+)_SMB", table, re.IGNORECASE)
+    return m.group(1) if m else table
+
+
+def group_by_scb(columns) -> dict:
+    """Group SCB columns by their SCB index → {1: [cols], 2: [cols], …} (ordered)."""
+    groups: dict[int, list] = {}
+    for c in columns:
+        m = re.match(r"^SCB(\d+)_", c)
+        if m:
+            groups.setdefault(int(m.group(1)), []).append(c)
+    return dict(sorted(groups.items()))
+
+
+# ── Data access ──────────────────────────────────────────────────────────────
+def _discover_scb_columns(db, table: str):
+    """All SCB* columns of a table + their data types, in physical order — one query."""
+    sql = text("""
+        SELECT COLUMN_NAME, DATA_TYPE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = :t AND TABLE_SCHEMA = 'dbo' AND COLUMN_NAME LIKE 'SCB%'
+        ORDER BY ORDINAL_POSITION
+    """)
+    cols, types = [], {}
+    for name, dtype in db.execute(sql, {"t": table}).fetchall():
+        if _safe_name(name):
+            cols.append(name)
+            types[name] = (dtype or "").lower()
+    return cols, types
+
+
+def _fetch_table_rows(db, table, cols, col_types, from_dt, to_dt, interval, agg):
+    """
+    Lean, batched fetch for one inverter table.
+
+    - Selects ONLY the required SCB columns — never SELECT *.
+    - No COUNT round-trip (export doesn't need a total).
+    - Reads in batches of _FETCH_BATCH rows so large datasets never buffer one huge
+      result set, bounded by _MAX_ROWS.
+    Returns a list of {"timestamp": iso, col: value, …} dicts.
+    """
+    if not cols:
+        return []
+
+    if intervals.is_instant(interval):
+        select = ", ".join(f"[{c}]" for c in cols)
+        base = (
+            f"SELECT TimeCol, {select} FROM [{table}] "
+            f"WHERE TimeCol BETWEEN :f AND :t ORDER BY TimeCol"
+        )
+    else:
+        grp = _build_interval_expr(interval)
+        parts = []
+        for c in cols:
+            if col_types.get(c) in _TEXT_TYPES:
+                parts.append(f"MIN([{c}]) AS [{c}]")
+            else:
+                fn = {
+                    "avg": f"AVG(CAST([{c}] AS FLOAT))",
+                    "min": f"MIN(CAST([{c}] AS FLOAT))",
+                    "max": f"MAX(CAST([{c}] AS FLOAT))",
+                    "sum": f"SUM(CAST([{c}] AS FLOAT))",
+                }.get(agg, f"AVG(CAST([{c}] AS FLOAT))")
+                parts.append(f"{fn} AS [{c}]")
+        base = (
+            f"SELECT {grp} AS TimeCol, {', '.join(parts)} FROM [{table}] "
+            f"WHERE TimeCol BETWEEN :f AND :t GROUP BY {grp} ORDER BY {grp}"
+        )
+
+    # ONE ordered query, pulled off the server-side cursor in batches (fetchmany) —
+    # this avoids the OFFSET/FETCH "re-scan from the top" that deep paging incurs.
+    # The _MAX_ROWS safety cap is preserved, so the returned rows (and therefore the
+    # exported data) are unchanged; only the read strategy is faster.
+    result = db.execute(text(base), {"f": from_dt, "t": to_dt})
+    rows = []
+    try:
+        while len(rows) < _MAX_ROWS:
+            batch = result.fetchmany(_FETCH_BATCH)
+            if not batch:
+                break
+            for r in batch:
+                d = {"timestamp": r[0].isoformat() if hasattr(r[0], "isoformat") else str(r[0] or "")}
+                for i, c in enumerate(cols):
+                    v = r[i + 1]
+                    d[c] = round(v, 4) if isinstance(v, float) else v
+                rows.append(d)
+                if len(rows) >= _MAX_ROWS:
+                    break
+    finally:
+        result.close()
+    return rows
+
+
+def _fetch_inverter(table, req_tags, from_str, to_str, interval, agg):
+    """
+    Worker: discover + lean-fetch ONE inverter on its own DB session (thread-safe).
+
+    The rows are fetched exactly once per inverter. Columns are driven entirely by
+    the tags the UI selected (`req_tags`), in the UI's own order — there is no
+    predefined SMB column list anywhere in this path. Selected tags that do not
+    exist in the table are returned as `missing` and logged as an ERROR rather than
+    silently dropped.
+
+    The columns are NOT grouped or chunked in any way — every selected tag becomes
+    its own column in a single table. (The export used to bucket them by SCB index
+    via `group_by_scb`, which produced 21 sections of 16 columns; that grouping has
+    been removed from the layout path.)
+
+    Returns (table, present_columns, missing_tags, rows).
+    """
+    session = SessionLocal()
+    try:
+        t0 = time.time()
+        cols, col_types = _discover_scb_columns(session, table)
+        missing: list = []
+
+        if req_tags:
+            # UI ORDER is authoritative — iterate req_tags, not the physical schema,
+            # so the exported column order matches what the operator selected.
+            present = [t for t in req_tags if t in col_types]
+            missing = [t for t in req_tags if t not in col_types]
+            if missing:
+                logger.info(
+                    "SMB export | %s: %d of %d selected tag(s) do NOT exist on this inverter — "
+                    "omitted here (this workbook shows only the SMBs this inverter has): %s",
+                    table, len(missing), len(req_tags), missing[:10],
+                )
+            cols = present
+            col_types = {c: col_types[c] for c in cols}
+
+        rows = _fetch_table_rows(session, table, cols, col_types, from_str, to_str, interval, agg)
+        logger.info(
+            "SMB fetch %s | tags_selected=%d | db_columns_fetched=%d | tags_missing_from_db=%d | "
+            "%d rows in %.1fs",
+            table, len(req_tags or cols), len(cols), len(missing), len(rows), time.time() - t0,
+        )
+        return table, cols, missing, rows
+    except Exception as e:  # noqa: BLE001 — a bad table shouldn't kill the workbook
+        logger.error("SMB data fetch failed for %s: %s", table, e, exc_info=True)
+        return table, [], list(req_tags or []), []
+    finally:
+        session.close()
+
+
+# ── Per-inverter workbook (rendered by the shared report_excel service) ──────
+def _split_present_by_smb(present):
+    """
+    Split an inverter's present columns into one group per String Combiner (SMB),
+    keyed by the SCB index in each column name (SCB1_… → 1), UI order preserved
+    within each group and groups returned in ascending SMB order.
+
+    The SMB count is DISCOVERED from the columns themselves — never a fixed number —
+    so an inverter with 18 SCBs yields 18 groups and one with 21 yields 21. Any column
+    that carries no SCB<n>_ prefix (none in normal SMB data) is returned separately so
+    it is never dropped. Returns (ordered {smb_index: [cols]}, [ungrouped_cols]).
+    """
+    groups: dict = {}
+    ungrouped: list = []
+    for c in present:
+        m = re.match(r"^SCB0*(\d+)_", c)
+        if m:
+            groups.setdefault(int(m.group(1)), []).append(c)
+        else:
+            ungrouped.append(c)
+    return dict(sorted(groups.items())), ungrouped
+
+
+def _build_inverter_workbook(table, present, missing, rows, req_tags,
+                             from_d, to_d, interval_label, agg_label):
+    """
+    Build ONE inverter's workbook with ONE worksheet PER String Combiner (SMB): the
+    inverter's columns are split by their SCB index into separate tabs named
+    SMB1, SMB2, … SMB{k} — one tab per SMB, discovered dynamically from the columns
+    present (never a fixed count). Each tab carries Timestamp + ONLY that SMB's columns
+    (UI order preserved) and repeats the SAME report header block (company title,
+    Equipment Type/ID, From/To/Interval/Aggregation) with identical formatting.
+
+        INV1.xlsx
+         ├── SMB1   | Timestamp | SCB1_* columns |
+         ├── SMB2   | Timestamp | SCB2_* columns |
+         │   …
+         └── SMB21  | Timestamp | SCB21_* columns |
+
+    No column is dropped, none is reordered, and no data value is changed — only the
+    columns' distribution across worksheets changes (they used to share one sheet).
+    Returns (bytes, inv, nsheets). Shared by the browser export (`_smb_bytes`) and the
+    to-Downloads export, so both produce identical INV{n}.xlsx content.
+    """
+    from app.services import report_excel
+
+    inv = _inv_no(table)
+
+    groups, ungrouped = _split_present_by_smb(present)
+
+    logger.info("SMB workbook | INV%s | columns=%d | SMB tabs=%d%s | absent_here=%d",
+                inv, len(present), len(groups),
+                f" (+{len(ungrouped)} ungrouped)" if ungrouped else "", len(missing))
+    if missing:
+        logger.info("    %d selected tag(s) not present on INV%s — omitted: %s",
+                    len(missing), inv, missing[:20])
+
+    # Header block — company title A1, Equipment Type, Equipment ID, From, To,
+    # Interval, Aggregation (unchanged). Copied per sheet so each tab is self-contained.
+    header = {
+        "equipment_type": "String Combiner",
+        "equipment_id":   f"INV{inv}",
+        "from": from_d, "to": to_d,
+        "interval": interval_label, "agg": agg_label,
+    }
+
+    # One spec (→ one worksheet tab) per SMB, in ascending SMB order. Each spec
+    # re-iterates the SAME single fetch (`iter(rows)`), so no query is repeated and
+    # every tab shows the same timestamps — only its own SMB's columns differ.
+    specs = [(f"SMB{k}", dict(header), ["timestamp"] + cols, iter(rows), _col_header)
+             for k, cols in groups.items()]
+    if ungrouped:
+        # Safety net: columns with no SCB index still get a home so nothing is dropped.
+        # Named to never collide with the SMB{k} tabs above.
+        specs.append((f"SMB{inv}" if not groups else "SMB_Other",
+                      dict(header), ["timestamp"] + ungrouped, iter(rows), _col_header))
+    if not specs:
+        # No columns at all (this inverter has none of the selected tags) → keep a
+        # single valid sheet so the empty-workbook behaviour is unchanged.
+        specs = [(f"SMB{inv}", dict(header), ["timestamp"] + present, iter(rows), _col_header)]
+
+    wb = report_excel.build_workbook_streaming(specs, wide_print_layout=True)
+    return wb, inv, len(specs)
+
+
+def _smb_bytes(req, equipment_ids, progress=None):
+    """
+    Build the String Combiner export as ONE workbook per inverter, with ONE worksheet
+    per String Combiner (SCB) — named SMB1, SMB2, … SMB{k}. There is NO Part1/Part2
+    splitting; each SMB sheet holds ALL of that SCB's columns (plus Timestamp).
+
+        INV1.xlsx                 INV2.xlsx
+         ├── SMB1                   ├── SMB1
+         ├── SMB2                   ├── SMB2
+         │   …                      │   …
+         └── SMB21                  └── SMB18
+
+    The number of SCBs is discovered DYNAMICALLY per inverter from its columns
+    (`group_by_scb`) — never hardcoded, and each inverter may have a different count.
+    A single selected inverter returns its `INV{n}.xlsx`; several inverters return a
+    ZIP of per-inverter workbooks (sheet names like "SMB1" would collide inside one
+    combined workbook). Each inverter is fetched ONCE (in parallel) and every one of
+    its SMB sheets renders a column slice of that SAME single read — no query is ever
+    repeated, and the report header / formatting / styles / filters / column order /
+    data are byte-for-byte what they were; only the worksheet organisation changed.
+    Returns (bytes, filename, content_type).
+    """
+    from app.services import report_excel  # noqa: F401 — installs faster .xlsx zip packaging
+
+    tables = [t for t in equipment_ids if _safe_name(t)]
+    interval = req.interval.value if hasattr(req.interval, "value") else str(req.interval)
+    agg      = req.agg_function.value if hasattr(req.agg_function, "value") else str(req.agg_function)
+    from_str = req.from_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    to_str   = req.to_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    from_d   = req.from_datetime.strftime("%d/%m/%Y")
+    to_d     = req.to_datetime.strftime("%d/%m/%Y")
+    interval_label = intervals.interval_label(interval)
+    agg_label      = intervals.agg_label(interval, agg)
+
+    # UI-selected tags drive the exported columns (injection-guarded, order preserved).
+    req_tags = [t for t in (req.tags or []) if _safe_name(t)]
+
+    t0 = time.time()
+    logger.info("SMB export start -> inverters=%d | selected_tags=%d | interval=%s",
+                len(tables), len(req_tags), interval)
+    if progress:
+        progress(3, f"Fetching {len(tables)} inverter(s)…")
+
+    # Parallel fetch — one query per inverter, reused by all of its SMB sections.
+    workers = min(len(tables), _MAX_WORKERS) or 1
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fetched = list(ex.map(
+            lambda t: _fetch_inverter(t, req_tags, from_str, to_str, interval, agg), tables))
+    db_secs = time.time() - t0
+
+    # ── One worksheet per SCB (SMB{k}); NO Part splitting ──────────────────────
+    def _inverter_workbook(table, present, missing, rows):
+        return _build_inverter_workbook(table, present, missing, rows, req_tags,
+                                        from_d, to_d, interval_label, agg_label)
+
+    t_render = time.time()
+    stamp = datetime.now().strftime("%d-%m-%Y_%H%M%S")
+
+    # Single inverter → one INV{n}.xlsx.
+    if len(fetched) == 1:
+        if progress:
+            progress(55, "Generating workbook (one sheet per SCB)…")
+        table, present, missing, rows = fetched[0]
+        data, inv, nsheets = _inverter_workbook(table, present, missing, rows)
+        filename, ctype = f"INV{inv}.xlsx", XLSX_CTYPE
+        if progress:
+            progress(100, "Export completed.")
+        logger.info("SMB export done -> 1 inverter (INV%s) | SMB sheets=%d | DB %.1fs | "
+                    "render %.1fs | %d bytes | file=%s",
+                    inv, nsheets, db_secs, time.time() - t_render, len(data), filename)
+        return data, filename, ctype
+
+    # Several inverters → ZIP of per-inverter INV{n}.xlsx workbooks. Each is built and
+    # then released after zipping, so peak memory stays ~one workbook (lower than the
+    # old single combined workbook). The parallel fetch above is unchanged.
+    buf = io.BytesIO()
+    total_sheets = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+        for i, (table, present, missing, rows) in enumerate(fetched, start=1):   # SELECTED ORDER
+            wb_bytes, inv, nsheets = _inverter_workbook(table, present, missing, rows)
+            zf.writestr(f"INV{inv}.xlsx", wb_bytes)
+            total_sheets += nsheets
+            del wb_bytes
+            if progress:
+                progress(55 + int(i / len(fetched) * 44), f"INV{inv} ({i}/{len(fetched)})…")
+    data = buf.getvalue()
+    filename, ctype = f"SMB_Report_{len(fetched)}INV_{stamp}.zip", ZIP_CTYPE
+    if progress:
+        progress(100, "Export completed.")
+    logger.info("SMB export done -> %d inverters (ZIP) | total SMB sheets=%d | DB %.1fs | "
+                "render %.1fs | %d bytes | file=%s",
+                len(fetched), total_sheets, db_secs, time.time() - t_render, len(data), filename)
+    return data, filename, ctype
+
+
+def build_smb_workbook(db, req, equipment_ids):
+    """Synchronous entry point (used by /export/excel). Returns (BytesIO, filename, content_type)."""
+    data, filename, ctype = _smb_bytes(req, equipment_ids, progress=None)
+    return io.BytesIO(data), filename, ctype
+
+
+def generate_smb_workbook_streaming(req, equipment_ids, progress=None):
+    """Background/async entry point (job + SSE progress). Returns (bytes, filename, content_type)."""
+    return _smb_bytes(req, equipment_ids, progress)
+
+
+# ── Direct-to-Downloads export (one parent folder, one INV{n}.xlsx per inverter) ─
+def _downloads_dir() -> str:
+    """Absolute path to the INTERACTIVE user's Downloads folder — resolved robustly
+    (see app.services.downloads): honours EXPORT_DOWNLOADS_DIR, else the console user's
+    real Downloads (OneDrive-aware, correct even when the backend runs as a service
+    account), never a temp dir or the project folder. Created if missing."""
+    from app.services.downloads import resolve_downloads_dir
+    return resolve_downloads_dir()
+
+
+def export_smb_to_downloads(req, equipment_ids, progress=None) -> dict:
+    """
+    Build ONE workbook per inverter and save them all inside this report type's folder
+    under the single "Reports" root (Reports\\<type>\\ — see downloads.resolve_reports_dir),
+    no ZIP:
+
+        Reports\\String Combiner\\INV1.xlsx, INV2.xlsx, … INV24.xlsx
+
+    Each INV{n}.xlsx has ONE worksheet per String Combiner — named SMB1, SMB2, …
+    SMB{k} (SCBs discovered dynamically per inverter) — and each SMB sheet holds ALL of
+    that SCB's columns (plus Timestamp). No Part1/Part2 splitting, no 40-column
+    splitting. Filenames, sheet names, headers, filters, formatting and data are
+    UNCHANGED — every file is rendered by the SAME `_build_inverter_workbook` the
+    browser export uses. Each inverter is read ONCE (in parallel) and reused across
+    all of its SMB sheets — the existing performance optimizations are preserved.
+
+    Returns {"directory", "folder_name", "saved":[…], "count", "sheets",
+             "excel_seconds", "total_seconds"}.
+    """
+    tables = [t for t in equipment_ids if _safe_name(t)]
+    interval = req.interval.value if hasattr(req.interval, "value") else str(req.interval)
+    agg      = req.agg_function.value if hasattr(req.agg_function, "value") else str(req.agg_function)
+    from_str = req.from_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    to_str   = req.to_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    from_d   = req.from_datetime.strftime("%d/%m/%Y")
+    to_d     = req.to_datetime.strftime("%d/%m/%Y")
+    interval_label = intervals.interval_label(interval)
+    agg_label      = intervals.agg_label(interval, agg)
+    req_tags = [t for t in (req.tags or []) if _safe_name(t)]
+
+    # All reports live under one "Reports" root, one subfolder per report type
+    # (Reports\<type>\INV{n}.xlsx). The type is the live equipment type — nothing
+    # hardcoded — so any report type automatically lands under the same Reports tree.
+    from app.services.downloads import resolve_reports_dir
+    report_type = req.equipment_type or "String Combiner"
+    target_dir  = resolve_reports_dir(report_type)
+    folder      = os.path.basename(target_dir)
+
+    n = len(tables)
+
+    def emit(pct, msg):
+        if progress:
+            try:
+                progress(int(pct), msg)
+            except Exception:
+                pass
+
+    emit(2, f"Processing {n} inverter(s) → Reports…")
+    logger.info("SMB folder export start -> inverters=%d | tags=%d | dir=%s | workers=%d",
+                n, len(req_tags), target_dir, min(n, _MAX_WORKERS) or 1)
+
+    t0 = time.time()
+    # Parallel fetch — one query per inverter, reused by all of its SMB sheets.
+    workers = min(n, _MAX_WORKERS) or 1
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fetched = list(ex.map(
+            lambda t: _fetch_inverter(t, req_tags, from_str, to_str, interval, agg), tables))
+
+    saved, written_paths, total_sheets = [], [], 0
+    for i, (table, present, missing, rows) in enumerate(fetched, start=1):   # SELECTED ORDER
+        data, inv, nsheets = _build_inverter_workbook(
+            table, present, missing, rows, req_tags, from_d, to_d, interval_label, agg_label)
+        path = os.path.join(target_dir, f"INV{inv}.xlsx")   # loose in the parent folder
+        with open(path, "wb") as fh:
+            fh.write(data)
+        saved.append(f"INV{inv}.xlsx")
+        written_paths.append(path)
+        total_sheets += nsheets
+        del data
+        emit(5 + i * 93 / n, f"INV{inv} done ({i}/{n})…")
+
+    # Verify every workbook really exists on disk — a reported success with no files
+    # means a wrong/unwritable location; surface it as an error, not a false toast.
+    from app.services.downloads import verify_files_written
+    verify_files_written(written_paths)
+
+    total_s = max(time.time() - t0, 1e-6)
+    logger.info("BENCH TOTAL | SMB folder | files=%d | sheets=%d | excel_gen=%.1fs | saved=%s",
+                len(saved), total_sheets, total_s, target_dir)
+    logger.info("SMB export SAVED -> %s", target_dir)
+    emit(100, f"Saved {len(saved)} report(s) to {target_dir}")
+    return {"directory": target_dir, "path": target_dir, "folder_name": folder, "saved": saved,
+            "count": len(saved), "sheets": total_sheets,
+            "excel_seconds": round(total_s, 2), "total_seconds": round(total_s, 2)}
+
+
+# ── Per-SCB folder export → D:\SMB\INV{n}\SCB{k}.xlsx ────────────────────────────
+# NEW export organisation (client requirement) that leaves the existing combined
+# workbook export completely untouched. One Excel file per String Combiner, grouped
+# into a folder per inverter:
+#
+#     <SMB_EXPORT_DIR>\INV1\SCB1.xlsx, SCB2.xlsx, …
+#     <SMB_EXPORT_DIR>\INV2\SCB1.xlsx, …
+#
+# The SCBs are DISCOVERED per inverter from the live schema (never assumed identical
+# across inverters, never a fixed count). Each SCB file's content — company header,
+# Equipment Type/ID, From/To/Interval/Aggregation, unit-labelled bold headers, styles,
+# 3-decimal numbers, DD/MM/YYYY timestamps — is produced by the SAME
+# `report_excel.build_workbook_streaming` writer as the combined export, so a given
+# SCB's columns are byte-for-byte identical to that SCB's slice in the old workbook.
+def _smb_export_dir() -> str:
+    """Base output folder for the per-SCB export. Configurable (never hardcoded);
+    defaults to D:\\SMB. Created if missing."""
+    d = os.environ.get("SMB_EXPORT_DIR") or os.path.join("D:\\", "SMB")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _build_inverter_scb_folder(table, req_tags, from_d, to_d, from_str, to_str,
+                               interval, agg, base_dir):
+    """
+    Pool worker: fetch ONE inverter once, then write one SCB{k}.xlsx per discovered
+    String Combiner into <base_dir>\\INV{n}\\. Returns a picklable summary tuple.
+    """
+    from app.services import report_excel
+
+    session = SessionLocal()
+    try:
+        # ONE read of this inverter (only the requested columns, fetchmany-batched);
+        # reused for every SCB file — no query is ever repeated per SCB.
+        _t, present, missing, rows = _fetch_inverter(
+            table, req_tags, from_str, to_str, interval, agg)
+
+        # Group the PRESENT columns by their SCB index, order preserved. This is the
+        # dynamic discovery — an inverter with fewer/more SCBs simply yields fewer/more
+        # files; nothing is assumed about the count.
+        by_scb = group_by_scb(present)
+
+        inv    = _inv_no(table)
+        folder = os.path.join(base_dir, f"INV{inv}")
+        os.makedirs(folder, exist_ok=True)
+
+        interval_label = intervals.interval_label(interval)
+        agg_label      = intervals.agg_label(interval, agg)
+
+        written = []
+        for k, scb_cols in by_scb.items():
+            header = {
+                "equipment_type": "String Combiner", "equipment_id": f"INV{inv}",
+                "from": from_d, "to": to_d,
+                "interval": interval_label, "agg": agg_label,
+            }
+            # Same writer/args as the combined export → identical cell content for
+            # this SCB's columns. One worksheet per file (named SCB{k}).
+            spec = (f"SCB{k}", header, ["timestamp"] + scb_cols, iter(rows), _col_header)
+            data = report_excel.build_workbook_streaming([spec], wide_print_layout=True)
+            path = os.path.join(folder, f"SCB{k}.xlsx")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            written.append(f"SCB{k}.xlsx")
+
+        return f"INV{inv}", folder, len(rows), sorted(by_scb.keys()), missing, written
+    finally:
+        session.close()
+
+
+def export_smb_to_folders(req, equipment_ids, progress=None) -> dict:
+    """
+    Write the String Combiner report as one Excel file per SCB, foldered by inverter:
+        <SMB_EXPORT_DIR>\\INV{n}\\SCB{k}.xlsx
+
+    Inverters are processed in parallel (each on its own pooled DB connection); every
+    inverter is read exactly once and its SCBs discovered from the live schema. Only
+    the export ORGANISATION changes — each file's Excel content is identical to the
+    corresponding columns in the existing combined workbook. Returns a summary dict.
+    """
+    tables = [t for t in equipment_ids if _safe_name(t)]
+    if not tables:
+        raise RuntimeError("No valid inverters selected")
+
+    interval = req.interval.value if hasattr(req.interval, "value") else str(req.interval)
+    agg      = req.agg_function.value if hasattr(req.agg_function, "value") else str(req.agg_function)
+    from_str = req.from_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    to_str   = req.to_datetime.strftime("%Y-%m-%d %H:%M:%S")
+    from_d   = req.from_datetime.strftime("%d/%m/%Y")
+    to_d     = req.to_datetime.strftime("%d/%m/%Y")
+    req_tags = [t for t in (req.tags or []) if _safe_name(t)]
+
+    # One "Reports" root, one subfolder per report type (Reports\<type>\INV{n}\SCB{k}.xlsx).
+    from app.services.downloads import resolve_reports_dir
+    base_dir = resolve_reports_dir(req.equipment_type or "String Combiner")
+    n = len(tables)
+
+    def emit(pct, msg):
+        if progress:
+            try:
+                progress(int(pct), msg)
+            except Exception:
+                pass
+
+    emit(3, f"Exporting {n} inverter(s) → {base_dir} …")
+    logger.info("SMB folder export start -> inverters=%d | selected_tags=%d | interval=%s | dir=%s",
+                n, len(req_tags), interval, base_dir)
+
+    t0 = time.time()
+    inverters, total_files, done = [], 0, 0
+    workers = min(_MAX_WORKERS, n) or 1
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_build_inverter_scb_folder, t, req_tags, from_d, to_d,
+                          from_str, to_str, interval, agg, base_dir): t for t in tables}
+        for fut in as_completed(futs):
+            inv, folder, nrows, scb_keys, missing, files = fut.result()
+            if missing:
+                logger.warning("SMB folder export | %s: %d selected tag(s) not in table: %s",
+                               inv, len(missing), missing[:10])
+            logger.info("SMB folder | %s | rows=%d | scbs=%d (%s) | files=%d",
+                        inv, nrows, len(scb_keys), scb_keys, len(files))
+            inverters.append({"inverter": inv, "folder": folder, "scbs": len(files),
+                              "files": files})
+            total_files += len(files)
+            done += 1
+            emit(3 + done * 95 / n, f"{inv} done ({done}/{n}) · {len(files)} SCB file(s)")
+
+    logger.info("SMB folder export DONE | inverters=%d | files=%d | %.1fs | dir=%s",
+                n, total_files, time.time() - t0, base_dir)
+    emit(100, f"Saved {total_files} SCB file(s) across {n} inverter folder(s) to {base_dir}.")
+    return {"directory": base_dir, "inverters": inverters, "count": n, "files": total_files}

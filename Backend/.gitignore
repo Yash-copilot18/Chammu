@@ -1,0 +1,20 @@
+# Environment / secrets — never commit real credentials
+.env
+*.env
+!.env.example
+
+# Python
+# Both spellings: this project uses .venv, and "venv/" alone does not match it.
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Generated report output. These are build artefacts, not source, and the ones
+# carried over from the reference plant are Kalyon-branded — nothing to do with
+# this site. Kept on disk, out of the repository.
+prototypes/output/
+*.pdf

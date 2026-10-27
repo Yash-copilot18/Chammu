@@ -1,0 +1,269 @@
+# app/main.py
+
+import logging
+import sys
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from sqlalchemy.exc import SQLAlchemyError
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("=" * 60)
+    logger.info("GE Solar Monitoring API — Starting up")
+    logger.info("=" * 60)
+
+    from app.database.base import import_all_models, Base
+    from app.database.session import verify_database_connection, engine
+
+    import_all_models()
+
+    connected = verify_database_connection()
+    if not connected:
+        logger.critical("Cannot connect to SQL Server. Shutting down.")
+        sys.exit(1)
+
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database tables verified / created successfully.")
+    except Exception as e:
+        logger.critical(f"Failed to create database tables: {e}")
+        sys.exit(1)
+
+    # Warm the DB schema cache (single query) so report tag-validation runs fully
+    # in-memory — no per-request INFORMATION_SCHEMA lookups.
+    from app.services import schema_cache
+    from app.database.session import SessionLocal
+    try:
+        with SessionLocal() as _db:
+            schema_cache.load_all(_db)
+    except Exception as e:
+        logger.warning("Schema cache warm-up failed (will lazy-load per table): %s", e)
+
+    # Validate SMTP configuration (non-fatal — email sending degrades gracefully).
+    from app.services import email_service
+    email_service.log_startup_status()
+
+    # Scheduled Reports now supports only DGR / MGR / YGR. Mark any schedule of a
+    # now-removed report type as Paused (kept in the DB, hidden from the UI, never run).
+    try:
+        from app.services import schedule_service
+        from app.database.session import SessionLocal
+        with SessionLocal() as _db:
+            schedule_service.deactivate_unsupported_schedules(_db)
+    except Exception as e:  # noqa: BLE001 — never block startup on this cleanup
+        logger.error("Schedule cleanup failed: %s", e, exc_info=True)
+
+    # Background scheduler for automatic report delivery. Guarded so only one
+    # process runs it (safe under uvicorn --reload / multiple workers).
+    from app.services import scheduler
+    try:
+        scheduler.start_scheduler()
+    except Exception as e:  # noqa: BLE001 — never block startup on the scheduler
+        logger.error("Failed to start scheduler: %s", e, exc_info=True)
+
+    logger.info("Application startup complete. Ready to accept requests.")
+    yield
+
+    from app.services import scheduler as _sched
+    _sched.stop_scheduler()
+
+    from app.database.session import engine as eng
+    logger.info("Shutting down — disposing database connection pool.")
+    eng.dispose()
+    logger.info("Shutdown complete.")
+
+
+# ── App Instance ──────────────────────────────────────────────────────────────
+# Interactive API docs are a development aid: they enumerate every route and schema,
+# which is reconnaissance for anyone who can reach the host. They stay ON by default so
+# nothing changes for local work, and switch OFF when ENV=production (or by setting
+# ENABLE_API_DOCS=false explicitly).
+# APP_ENV is the name the shipped .env.example already documents; ENV is accepted as a
+# fallback so either spelling works rather than introducing a competing variable.
+_env = (os.getenv("APP_ENV") or os.getenv("ENV") or "development").strip().lower()
+_docs_default = "false" if _env in ("production", "prod") else "true"
+ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", _docs_default).strip().lower() in ("1", "true", "yes")
+
+app = FastAPI(
+    title="GE Solar Monitoring API",
+    # This description is public whenever the docs are served, so it carries NO
+    # infrastructure detail. The database server/name and auth mode were listed here —
+    # that told an unauthenticated caller exactly what to attack. Those values live in
+    # the environment and are logged server-side at startup instead.
+    description=(
+        "FastAPI backend for the Solar Power Plant Monitoring and "
+        "Report Automation System."
+    ),
+    version="1.0.0",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
+    lifespan=lifespan,
+)
+
+
+# ── CORS ──────────────────────────────────────────────────────────────────────
+cors_origins_raw = os.getenv(
+    "CORS_ORIGINS",
+    "http://localhost:5173,http://localhost:3000"
+)
+cors_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()]
+
+# A wildcard origin combined with allow_credentials is rejected by browsers and, worse,
+# invites a deployment that believes it is locked down when it is not. Fail loudly at
+# startup instead of serving a permissive policy: list the real origins in CORS_ORIGINS.
+if "*" in cors_origins:
+    raise RuntimeError(
+        "CORS_ORIGINS must list explicit origins — '*' cannot be combined with "
+        "credentialed requests. Set CORS_ORIGINS to the exact frontend URL(s)."
+    )
+logger.info("CORS allowed origins: %s", cors_origins)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["X-Total-Count", "Content-Disposition"],
+)
+
+
+# ── Exception Handlers ────────────────────────────────────────────────────────
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = []
+    for error in exc.errors():
+        errors.append({
+            "field":   " -> ".join(str(loc) for loc in error["loc"]),
+            "message": error["msg"],
+            "type":    error["type"],
+        })
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Validation error", "errors": errors},
+    )
+
+
+@app.exception_handler(SQLAlchemyError)
+async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+    logger.error(f"Unhandled SQLAlchemy error: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "A database error occurred. Please try again."},
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "An internal server error occurred."},
+    )
+
+
+# ── Routers ───────────────────────────────────────────────────────────────────
+from app.routers import (
+    health,
+    equipment,
+    reports,
+    dashboard,
+    analytics,
+    equipment_live,
+    reports_v2,
+    scheduled,
+    tracker,
+    isolator,
+    saved_reports,
+)
+
+# ── Enabled features ─────────────────────────────────────────────────────────
+# This deployment serves FORECASTING ONLY.
+#
+# The other routers are not registered, so their endpoints return 404 rather
+# than 500. That distinction matters: every one of them queries tables this
+# plant does not have - PPC, POWER_GRAPH, INVERTER_DAILY_GEN, TEMPERATURE_REPORT,
+# Alarms, the tracker tables - and a 500 would look like a broken server instead
+# of a feature that was never wired up for this site.
+#
+# Nothing is deleted. Set ENABLE_ALL_FEATURES=1 to register them again once the
+# CHAMMU schema has been mapped onto each one.
+ENABLE_ALL_FEATURES = os.getenv("ENABLE_ALL_FEATURES", "").strip() in ("1", "true", "True")
+
+app.include_router(health.router)
+
+if ENABLE_ALL_FEATURES:
+    app.include_router(equipment.router,      prefix="/api/v1")
+    app.include_router(reports.router,        prefix="/api/v1")
+    app.include_router(dashboard.router,      prefix="/api/v1")
+    app.include_router(analytics.router,      prefix="/api/v1")
+    app.include_router(equipment_live.router, prefix="/api/v1")
+    app.include_router(reports_v2.router,     prefix="/api/v1")
+    app.include_router(scheduled.router,      prefix="/api/v1")
+    app.include_router(tracker.router,        prefix="/api/v1")
+    app.include_router(isolator.router,       prefix="/api/v1")
+    app.include_router(saved_reports.router,  prefix="/api/v1")
+    logger.warning(
+        "ENABLE_ALL_FEATURES is set. The reporting routers are registered, but "
+        "they query tables CHAMMU does not have and will fail at request time.")
+else:
+    logger.info("Forecasting-only deployment: reporting routers are not registered.")
+
+# Forecasting needs the numeric stack (numpy, scikit-learn). Those are declared
+# in requirements.txt, but an environment that has not been updated must still
+# serve the dashboard: a missing OPTIONAL dependency may disable one feature,
+# never the whole API. The failure is logged loudly with the fix, rather than
+# being swallowed.
+try:
+    from app.routers import forecast
+    app.include_router(forecast.router, prefix="/api/v1")
+except ImportError as exc:                       # noqa: BLE001 - startup must survive
+    logger.warning(
+        "Forecasting is DISABLED - %s. Every other endpoint is unaffected. "
+        "To enable it, install the dependencies into the interpreter you run "
+        "the server with:  pip install -r requirements.txt", exc)
+
+
+# ── Root ──────────────────────────────────────────────────────────────────────
+@app.get("/", include_in_schema=False)
+def root():
+    return {
+        "service":           "GE Solar Monitoring API",
+        "version":           "1.0.0",
+        "docs":              "/docs",
+        "health":            "/health",
+        "db_test":           "/db-test",
+        "dashboard_kpis":    "/api/v1/dashboard/kpis",
+        "power_trend":       "/api/v1/dashboard/power-trend",
+        "daily_energy":      "/api/v1/dashboard/daily-energy",
+        "alarms":            "/api/v1/dashboard/alarms",
+        "equipment_live":    "/api/v1/equipment-live/",
+        "analytics":         "/api/v1/analytics/inverter-comparison",
+        "reports":           "/api/v1/reports/data",
+        "equipment_types":   "/api/v1/reports-v2/equipment-types",
+        "equipment_list":    "/api/v1/reports-v2/equipment-list?type=Inverter",
+        "tags":              "/api/v1/reports-v2/tags?equipment_type=Inverter&equipment_id=INVERTER_01",
+        "report_data":       "/api/v1/reports-v2/data",
+        "wms":               "/api/v1/reports/wms/latest",
+        "ppc":               "/api/v1/reports/ppc/latest",
+    }

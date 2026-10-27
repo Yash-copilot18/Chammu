@@ -1,108 +1,113 @@
-# SolarOps — Plant Monitoring
+# Chammu Solar Plant — Monitoring
 
-A standalone solar plant monitoring dashboard, independent of the Kalyon Niğde
-build in `../Frontend`. Same pages, same features, same visual language — but no
-plant hard-coded anywhere.
+Forecasting dashboard for the Chammu plant. Two halves, one repository:
 
-The two applications share no files, no build and no browser storage. Changing
-one cannot affect the other.
+```
+Layout/     React frontend (Vite)       — http://localhost:5173
+Backend/    FastAPI API                 — http://localhost:8001
+```
+
+Independent of the Kalyon Niğde project: separate code, separate database,
+separate repository. Nothing here affects it.
 
 ---
 
-## What is different from `../Frontend`
+## Running it
 
-| | `../Frontend` (Kalyon) | `SolarOps-Frontend` (this) |
+Backend, in its own terminal:
+
+```powershell
+cd Backend; .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+```
+
+Frontend, in another:
+
+```powershell
+cd Layout; npm run dev
+```
+
+First time on a new machine:
+
+```powershell
+cd Backend; python -m venv .venv; .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+cd ..\Layout; npm install
+```
+
+Neither `.env` is committed. Copy `.env.example` in each folder and fill it in.
+
+---
+
+## Scope
+
+This deployment serves **forecasting only**. `Layout/src/config/features.js`
+lists the enabled pages; every other page, route and component is still in the
+codebase and is re-enabled by adding its key to that list. On the API side,
+`ENABLE_ALL_FEATURES=1` registers the reporting routers again.
+
+The other pages are switched off because they query tables CHAMMU does not
+have — `PPC`, `POWER_GRAPH`, `INVERTER_DAILY_GEN`, `TEMPERATURE_REPORT`,
+`Alarms`, the tracker tables. Leaving them reachable would return 500s that
+look like a broken server rather than a feature not yet wired up for this site.
+
+---
+
+## How this plant differs from the reference plant
+
+The backend began as a copy of the Kalyon Niğde API, and CHAMMU's SCADA schema
+is not the same. What changed, and what it costs:
+
+| | Kalyon | CHAMMU |
 |---|---|---|
-| Plant identity | hard-coded in 7 files | `src/config/sites.js`, one place |
-| Header | `<h1>KALYON NIGDE 130 MW</h1>` | site picker: name + installed capacity |
-| Backend URL | one, from `VITE_API_URL` | per site, so switching site switches backend |
-| Storage keys | `ge_*`, `kalyon.*` | `solarops.*` |
-| Plant metadata | none | location, AC/DC capacity, equipment counts, commissioning date |
+| Inverters | `INVERTER_01`…`INVERTER_24` | `INVERTER_1`…`INVERTER_12` |
+| Plant power | `PPC.GRID_ACTIVE_POWER_MEASURED` | summed from the 12 inverters |
+| Irradiance | `WMS.AVG_GTI_IRRADIATION` | `WMS.GTI_RADIATION` |
+| Combiners | `INVERTERn_SMB` | `ICR1_SMB*`, `ICR2_SMB*`, `MCR_SMB*` |
 
-Everything else — every page, chart, KPI, table, filter, report and export — is
-carried over unchanged.
+Fleet size and name padding are configurable (`INVERTER_COUNT`,
+`INVERTER_NAME_PAD`), so neither is baked into the SQL.
 
----
+### Three limitations that follow
 
-## Configuring a plant
+**Generation is gross, not net.** It is summed at the inverters, so transformer
+losses, station auxiliaries and night-time import are all downstream and
+invisible. Real export at the point of connection is lower.
 
-### One plant
+**Curtailment cannot be detected.** There is no set-point channel on this
+plant, so `curtailment_detectable` is false. That means *not measurable*, not
+*did not happen* — a curtailed day looks to the model like a cloudy one.
 
-```bash
-cp .env.example .env
-# set VITE_API_URL to your backend
-npm install
-npm run dev
-```
+**The timezone of `TimeCol` is unverified.** On Kalyon it was proven to be UTC
+by two independent measurements. No equivalent check has been run here, so days
+are grouped by `TimeCol`'s own date. If the clock is local time and the site is
+far from UTC, a solar day may straddle two dates and daily totals will be wrong
+at the boundaries.
 
-### Several plants
-
-Set `VITE_SITES` to a JSON array. Each entry needs its own `apiUrl`:
-
-```
-VITE_SITES=[{"id":"north","name":"Northfield Solar Park","location":"Konya","capacityMw":130,"inverters":64,"apiUrl":"https://north.example.com"},{"id":"south","name":"Southgate Solar Park","location":"Antalya","capacityMw":85,"apiUrl":"https://south.example.com"}]
-```
-
-The picker then appears in the header. See `.env.example` for every field.
-
-**Why one backend per site.** The API has no site dimension: every endpoint
-answers for the single plant its database is attached to. A picker that changed
-the name above the page while the numbers underneath stayed the same would be
-presenting one plant's generation as another's. Switching site therefore
-switches backend and reloads, so no response from the previous plant can land in
-the new plant's charts.
-
-A site configured without an `apiUrl` is labelled **Not connected**, and a banner
-explains that the empty pages are unconfigured rather than an outage.
+`WEATHER_LAT` and `INSTALLED_CAPACITY_MW` are deliberately unset. An unset
+latitude disables the clear-sky quality rule rather than checking this plant's
+sky against another site's; an unset capacity leaves Performance Ratio blank
+rather than deriving it from a guessed nameplate.
 
 ---
 
-## Pages
+## The data is not sufficient to validate a forecast
 
-| Route | Page |
+| | |
 |---|---|
-| `/dashboard` | Operations Dashboard — plant information, 8 KPIs, power trend, irradiance vs power, daily energy |
-| `/reports` | Report Automation — equipment selection, date/time configuration, exports |
-| `/dgr` | Generation Reports — DGR / MGR / YGR, inverter-wise and monthly charts, PDF/Excel/CSV |
-| `/analytics` | Analytics & Performance — daily, monthly, top-10, PR trend, performer tables |
-| `/preconfigured` | Preconfigured Reports — saved templates, column builder |
-| `/forecast` | Generation Forecast & Deviation Detection |
-| `/scheduled` | Scheduled Reports |
-| `/users` | User Management |
+| Record | 2025-04-15 → 2025-07-19 |
+| Distinct days | 44, across an 86-day span — collection was intermittent |
+| Complete days (≥1380 min) | 42 |
+| With usable weather | 37 |
+| Usable for supervised training | 35 |
 
-Reachable by URL but hidden from the sidebar (`hidden: true` in
-`src/components/Sidebar/Sidebar.jsx`), exactly as in the original:
-`/tracker`, `/tracker-status`, `/ppc-trend`, `/power-graph`, `/equipment`,
-`/alarms`, `/settings`.
+A run is possible and the page shows next-day, 7-day and 30-day volumes, but
+the held-out test block is **7 days**. The reliability banner reads
+**INSUFFICIENT DATA** and `target_met` stays false regardless of the score,
+because clearing a target on seven settled days is not clearing it.
 
----
+Only the next-day figure is measured by the backtest. Beyond that the model
+feeds its own output back as the next lag, so with no future weather the series
+carries no new information and decays toward the recent average — a reasonable
+planning volume, not a forecast.
 
-## Shared components
-
-`src/components/Common/index.jsx` — `KpiCard`, `PageHeader`, `DataTable`,
-`Pagination`, `SearchInput`, `Skeleton`, `Spinner`, `ProgressBar`, `StatusDot`,
-`FormRow`, `FormGroup`, `Dialog`, `ConfirmDialog`, `PromptDialog`,
-`ToastContainer`, `Modal`, and new in this build: **`StatusBadge`**,
-**`InfoPanel`**, **`AlertCard`**, **`FactGrid`**.
-
-`src/components/Site/` — `SiteInfoPanel`, `UnconfiguredBanner`.
-`src/components/Header/SiteSelector.jsx` — the plant picker.
-
----
-
-## Theme
-
-Unchanged from the original: `--ge-*` CSS custom properties in `src/index.css`
-for dark and light, surfaced through Tailwind as `ge-navy`, `ge-card`,
-`ge-accent`, `ge-text1` and the rest. Dark is the default; the toggle is in the
-header.
-
----
-
-## Scripts
-
-```bash
-npm run dev        # Vite dev server
-npm run build      # production build to dist/
-npm run preview    # serve the build locally
-```
+**Roughly 6–12 months of continuous logging is needed before any accuracy claim
+can be made.** No code change substitutes for it.
