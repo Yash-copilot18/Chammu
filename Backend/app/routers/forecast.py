@@ -131,11 +131,131 @@ def forecast_next_day(db: Session = Depends(get_db)) -> Dict[str, Any]:
         "target_met": bool(run.target_met),
         "weather_forecast_used": bool(run.weather_forecast_used),
         "reliability": _reliability(run),
-        "horizons": _horizon_totals(forward),
+        "horizons": _horizon_totals(forward, run),
     }
 
 
-def _horizon_totals(forward: List[ForecastPoint]) -> Dict[str, Any]:
+def _horizon_evidence(run: ForecastRun) -> Dict[int, Dict[str, Any]]:
+    """
+    What the multi-horizon backtest actually measured, keyed by days ahead.
+
+    Returned so each card can state its own evidence instead of pointing at a
+    table further down the page. The sample size travels with the score,
+    because on this archive the backtest manages a single fold and a horizon
+    "scoring" 99% does so on one observation.
+    """
+    try:
+        detail = json.loads(run.detail_json) if run.detail_json else {}
+    except (ValueError, TypeError):
+        return {}
+    out: Dict[int, Dict[str, Any]] = {}
+    for h in detail.get("by_horizon") or []:
+        try:
+            out[int(h["horizon_days"])] = {
+                "score_pct": h.get("score_pct"),
+                "mae_mwh": h.get("mae_mwh"),
+                "n": int(h.get("n") or 0),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+# A horizon scored on fewer than this many observations is reported with the
+# count attached and never presented as established accuracy.
+MIN_HORIZON_OBSERVATIONS = 10
+
+
+def _horizon_quality(days: int, evidence: Dict[int, Dict[str, Any]],
+                     day1_observations: int = 0) -> Dict[str, Any]:
+    """
+    How much the backtest actually knows about a horizon of this length.
+
+    Three states, not two. The old "validated / unvalidated" split said day 1
+    was proven and everything else was guesswork, which was wrong in both
+    directions: day 1 is only as good as its sample, and days 2-7 ARE measured,
+    just thinly. The states are:
+
+      measured          scored on enough observations to mean something
+      measured_thin     scored, but on too few observations to rely on - the
+                        count is reported so the reader can judge it
+      not_measured      beyond anything the backtest covers
+
+    "label" is the badge text. "PLANNING ESTIMATE" rather than "UNVALIDATED"
+    because the figure is usable for planning volumes; what it is not is a
+    tested accuracy claim, and "basis" says so in words.
+    """
+    # Day 1 is measured by the day-ahead walk-forward, not by the multi-horizon
+    # backtest, and the two score different numbers of days. Using the
+    # multi-horizon count here would under-report the next-day evidence.
+    if days == 1:
+        n = int(day1_observations or 0)
+        enough = n >= MIN_HORIZON_OBSERVATIONS
+        return {
+            "quality": "measured" if enough else "measured_thin",
+            "validated": enough,
+            "label": "MEASURED" if enough else "PROVISIONAL",
+            "observations": n,
+            "basis": (
+                f"Measured by the day-ahead backtest on {n} held-out day"
+                f"{'' if n == 1 else 's'}."
+                + ("" if enough else
+                   f" That is below the {MIN_HORIZON_OBSERVATIONS} needed for the "
+                   f"figure to be stable, so treat it as provisional.")),
+        }
+
+    covered = [evidence[h] for h in range(1, days + 1) if h in evidence]
+    missing = [h for h in range(1, days + 1) if h not in evidence]
+    n_min = min((e["n"] for e in covered), default=0)
+    furthest = max(evidence) if evidence else 0
+
+    # Partial coverage counts as not measured. A 30-day total whose days 8-30
+    # were never backtested is not "thinly measured" - most of it is untested,
+    # and averaging that away would be the misleading version.
+    if not covered or missing:
+        return {
+            "quality": "not_measured",
+            "validated": False,
+            "label": "PLANNING ESTIMATE",
+            "observations": 0,
+            "basis": (
+                f"The backtest reaches day {furthest}; days {furthest + 1}-{days} "
+                f"have never been tested, so nothing measures how accurate a "
+                f"{days}-day total is. Each day is predicted from the previous "
+                "day's prediction with no new information entering, so the series "
+                "settles toward the recent average. Use it as an expected volume, "
+                "not as a forecast."
+                if furthest else
+                f"No horizon has been backtested, so nothing measures how accurate "
+                f"a {days}-day total is."),
+        }
+
+    if n_min >= MIN_HORIZON_OBSERVATIONS:
+        return {
+            "quality": "measured",
+            "validated": True,
+            "label": "MEASURED",
+            "observations": n_min,
+            "basis": (f"Every day in this block was backtested on at least "
+                      f"{n_min} held-out observations."),
+        }
+
+    return {
+        "quality": "measured_thin",
+        "validated": False,
+        "label": "PLANNING ESTIMATE",
+        "observations": n_min,
+        "basis": (
+            f"Backtested, but on as few as {n_min} observation"
+            f"{'' if n_min == 1 else 's'} per day-ahead step - below the "
+            f"{MIN_HORIZON_OBSERVATIONS} needed for the figure to be stable. "
+            "A score from that few days reflects which days fell in the window "
+            "as much as the model. Use as an expected volume, not an accuracy claim."),
+    }
+
+
+def _horizon_totals(forward: List[ForecastPoint],
+                    run: ForecastRun) -> Dict[str, Any]:
     """
     Weekly and monthly totals, summed from the daily forward predictions.
 
@@ -150,6 +270,7 @@ def _horizon_totals(forward: List[ForecastPoint]) -> Dict[str, Any]:
     volumes; not a forecast in the sense the next-day figure is.
     """
     rows = sorted(forward, key=lambda p: p.target_date)
+    evidence = _horizon_evidence(run)
 
     def block(days: int) -> Dict[str, Any]:
         take = rows[:days]
@@ -172,11 +293,7 @@ def _horizon_totals(forward: List[ForecastPoint]) -> Dict[str, Any]:
                          if have and all(u is not None for u in uppers) else None,
             "start": take[0].target_date if have else None,
             "end": take[-1].target_date if have else None,
-            "validated": days == 1,
-            "basis": ("Measured by the held-out backtest." if days == 1 else
-                      "Recursive extrapolation. Horizon 1 is the only one the "
-                      "backtest scores; these days are not independently "
-                      "validated and decay toward the recent average."),
+            **_horizon_quality(days, evidence, int(run.n_test or 0)),
         }
 
     out = {"next_day": block(1)}

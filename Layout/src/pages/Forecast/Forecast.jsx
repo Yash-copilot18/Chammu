@@ -42,6 +42,14 @@ const shortDate = (s) => (s ? String(s).slice(0, 10) : '—')
  * many days it does cover instead of quietly summing fewer and calling it a
  * month.
  */
+/** Badge colour per evidence state. Amber for thin, grey for untested — green
+ *  is reserved for a horizon the backtest actually covered properly. */
+const HORIZON_TONE = {
+  measured: 'green',
+  measured_thin: 'amber',
+  not_measured: 'neutral',
+}
+
 function HorizonCard({ label, h, fallback = null }) {
   const total = h?.total_mwh ?? null
   const shown = total != null ? fmt(total) : (fallback ?? '—')
@@ -52,9 +60,14 @@ function HorizonCard({ label, h, fallback = null }) {
         <span className="font-mono text-[10px] text-ge-text3 uppercase tracking-widest">
           {label}
         </span>
+        {/* Three states, not two. The badge is driven by `quality` from the
+            API: a figure the backtest measured well, one it measured on too
+            few days, and one it never reached. The sample size sits directly
+            underneath, because a badge alone invites the reader to assume the
+            number behind it was tested more than it was. */}
         {h && (
-          <StatusBadge tone={h.validated ? 'green' : 'neutral'}>
-            {h.validated ? 'VALIDATED' : 'UNVALIDATED'}
+          <StatusBadge tone={HORIZON_TONE[h.quality] || 'neutral'}>
+            {h.label || (h.validated ? 'MEASURED' : 'PLANNING ESTIMATE')}
           </StatusBadge>
         )}
       </div>
@@ -71,11 +84,23 @@ function HorizonCard({ label, h, fallback = null }) {
           {h.lower_mwh != null && (
             <div>range {fmt(h.lower_mwh)} – {fmt(h.upper_mwh)}</div>
           )}
+          {/* The evidence, on the card. */}
+          <div className={h.quality === 'measured' ? 'text-ge-text3' : 'text-amber-400'}>
+            {h.quality === 'not_measured'
+              ? 'not backtested at this range'
+              : `backtested on ${h.observations} day${h.observations === 1 ? '' : 's'}`}
+          </div>
           {!h.complete && (
             <div className="text-amber-400">
               only {h.days_available} of {h.days_requested} days predicted
             </div>
           )}
+        </div>
+      )}
+      {h?.basis && (
+        <div className="text-[10px] text-ge-text3 leading-relaxed mt-2 pt-2
+                        border-t border-ge-border/60">
+          {h.basis}
         </div>
       )}
     </div>
