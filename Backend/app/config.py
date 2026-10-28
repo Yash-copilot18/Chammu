@@ -31,3 +31,18 @@ def get_installed_capacity_mw() -> float:
 def get_installed_capacity_kw() -> float:
     """Installed capacity in kW (derived from the MW configuration)."""
     return get_installed_capacity_mw() * 1000.0
+
+
+# ── Service identity ─────────────────────────────────────────────────────────
+# The name this API reports in /health, / and the OpenAPI title.
+#
+# It was hardcoded to the original project's name in four separate files, so a
+# deployment for a different plant announced itself as somebody else's system —
+# visible to anyone who called /health. Configured here instead, so re-badging
+# is one environment variable and not a code change.
+APP_NAME_DEFAULT = "Solar Plant Monitoring API"
+
+
+def get_app_name() -> str:
+    """Service name for health responses, the root route and the docs title."""
+    return (os.getenv("APP_NAME", "") or "").strip() or APP_NAME_DEFAULT

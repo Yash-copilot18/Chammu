@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=" * 60)
-    logger.info("GE Solar Monitoring API — Starting up")
+    logger.info("%s — Starting up", APP_NAME)
     logger.info("=" * 60)
 
     from app.database.base import import_all_models, Base
@@ -103,8 +103,12 @@ _env = (os.getenv("APP_ENV") or os.getenv("ENV") or "development").strip().lower
 _docs_default = "false" if _env in ("production", "prod") else "true"
 ENABLE_API_DOCS = os.getenv("ENABLE_API_DOCS", _docs_default).strip().lower() in ("1", "true", "yes")
 
+
+from app.config import get_app_name
+APP_NAME = get_app_name()
+
 app = FastAPI(
-    title="GE Solar Monitoring API",
+    title=APP_NAME,
     # This description is public whenever the docs are served, so it carries NO
     # infrastructure detail. The database server/name and auth mode were listed here —
     # that told an unauthenticated caller exactly what to attack. Those values live in
@@ -248,7 +252,7 @@ except ImportError as exc:                       # noqa: BLE001 - startup must s
 @app.get("/", include_in_schema=False)
 def root():
     return {
-        "service":           "GE Solar Monitoring API",
+        "service":           APP_NAME,
         "version":           "1.0.0",
         "docs":              "/docs",
         "health":            "/health",

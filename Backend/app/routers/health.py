@@ -3,6 +3,7 @@
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import text
 from app.database.session import engine
+from app.config import get_app_name
 from app.database.connection import test_raw_connection
 import time
 
@@ -13,7 +14,7 @@ router = APIRouter(tags=["Health"])
 def health_check():
     return {
         "status": "ok",
-        "service": "GE Solar Monitoring API",
+        "service": get_app_name(),
         "version": "1.0.0",
     }
 
