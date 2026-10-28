@@ -22,7 +22,7 @@ function SiteIdentity({ site, compact = false }) {
       <div className="text-[10px] font-mono text-ge-text3 leading-tight truncate">
         {/* Capacity and location are labels the operator configures. Neither is
             measured, so an unconfigured field shows as a dash, never a guess. */}
-        {[cap, site.location].filter(Boolean).join(' · ') || 'Capacity not configured'}
+        {[cap, site.location].filter(Boolean).join(' · ')}
       </div>
     </div>
   )
