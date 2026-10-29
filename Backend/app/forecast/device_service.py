@@ -40,7 +40,8 @@ logger = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 # device id -> result dict. Survives requests, not restarts.
-_forecast_cache: Dict[str, Any] = {"generated_at": None, "devices": [], "running": False}
+_forecast_cache: Dict[str, Any] = {"generated_at": None, "devices": [],
+                                   "running": False, "total": 0}
 
 
 # ── per-inverter forecasting ─────────────────────────────────────────────────
@@ -206,19 +207,30 @@ def run_device_forecasts(db: Session) -> Dict[str, Any]:
     try:
         inv = D.discover(db)["inverters"]
         fresh = D.last_seen(db, [d["table"] for d in inv])
+        with _lock:
+            # Clear previous results at the start. A run takes minutes, and
+            # leaving the old rows in place while it works makes the progress
+            # count read as "11 of 12 done" from the first second.
+            _forecast_cache["devices"] = []
+            _forecast_cache["total"] = len(inv)
         out = []
         for device in inv:
             rows = D.daily_inverter(db, device["table"])
             row = _forecast_one(rows, device)
             row["last_seen"] = fresh.get(device["table"])
             out.append(row)
+            # Published as each device finishes, so the UI can show real
+            # progress rather than a spinner with nothing behind it.
+            with _lock:
+                _forecast_cache["devices"] = list(out)
             logger.info("device forecast %s: %s (%s complete days)",
                         device["id"], row["status"], row["complete_days"])
         result = {"ok": True, "generated_at": datetime.now(),
                   "devices": out, "n_devices": len(out)}
         with _lock:
             _forecast_cache.update({"generated_at": result["generated_at"],
-                                    "devices": out, "running": False})
+                                    "devices": out, "running": False,
+                                    "total": len(inv)})
         return result
     except Exception:
         with _lock:
@@ -228,9 +240,13 @@ def run_device_forecasts(db: Session) -> Dict[str, Any]:
 
 def cached_forecasts() -> Dict[str, Any]:
     with _lock:
+        devices = list(_forecast_cache["devices"])
         return {"generated_at": _forecast_cache["generated_at"],
-                "devices": list(_forecast_cache["devices"]),
-                "n_devices": len(_forecast_cache["devices"]),
+                "devices": devices,
+                "n_devices": len(devices),
+                # How many the run will produce in total, so a caller polling
+                # mid-run can show "4 of 12" rather than a bare count.
+                "total": int(_forecast_cache.get("total") or len(devices)),
                 "running": bool(_forecast_cache.get("running"))}
 
 

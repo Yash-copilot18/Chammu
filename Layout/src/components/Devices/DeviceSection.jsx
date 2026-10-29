@@ -91,18 +91,42 @@ export default function DeviceSection() {
     return () => { cancelled = true }
   }, [tab, combiners])
 
+  // A run already under way is reported by the server, so the button stays
+  // disabled across a page reload instead of inviting a second click that can
+  // only ever be rejected.
+  const serverRunning = !!forecasts?.running
+  const busy = running || serverRunning
+
   const onRun = async () => {
-    if (running) return
+    if (busy) return
     setRunning(true); setError('')
     try {
       await runDeviceForecasts()
       setForecasts(await fetchDeviceForecasts())
     } catch (e) {
-      setError(e?.message || 'Device forecast run failed.')
+      // "already in progress" is not a failure — the run the user asked for is
+      // happening. Showing it in red taught people to click again, which is
+      // the one thing that cannot help.
+      const msg = e?.message || 'Device forecast run failed.'
+      if (/already in progress/i.test(msg)) {
+        setForecasts(await fetchDeviceForecasts())
+      } else {
+        setError(msg)
+      }
     } finally {
       setRunning(false)
     }
   }
+
+  // While a run is under way, poll until it finishes so the table fills in on
+  // its own rather than waiting for the user to reload.
+  useEffect(() => {
+    if (!serverRunning) return
+    const id = setInterval(async () => {
+      try { setForecasts(await fetchDeviceForecasts()) } catch { /* keep polling */ }
+    }, 5000)
+    return () => clearInterval(id)
+  }, [serverRunning])
 
   const newest = inventory?.inverters?.reduce(
     (a, d) => (!a || (d.last_seen && d.last_seen > a) ? d.last_seen : a), null)
@@ -221,9 +245,10 @@ export default function DeviceSection() {
       <div className="card-title mb-2 justify-between flex-wrap gap-2">
         <span>Device-wise forecasting and performance</span>
         {tab === 'inverters' && (
-          <button className="btn btn-outline btn-sm" onClick={onRun} disabled={running}>
-            {running
-              ? <><Spinner size={12} /> Running {counts.inverters || ''} devices…</>
+          <button className="btn btn-outline btn-sm" onClick={onRun} disabled={busy}>
+            {busy
+              ? <><Spinner size={12} /> Running… {invRows.length} of{' '}
+                  {forecasts?.total || counts.inverters || '?'}</>
               : <><MdRefresh className="text-sm" /> Run device forecasts</>}
           </button>
         )}
@@ -269,19 +294,23 @@ export default function DeviceSection() {
         <>
           {/* The one thing a reader must not do with this table is add it up
               and call the result the plant forecast. Said before the numbers,
-              not in a footnote after them. */}
-          <InfoPanel tone="amber" className="mb-3"
-            title="This is a breakdown, not the plant forecast">
-            The official plant forecast is the one above, measured on all twelve
-            inverters' history. This table covers{' '}
-            <b>{eligible} of {counts.inverters ?? 12} inverters</b> —{' '}
-            {ineligible.length > 0
-              ? <>{ineligible.join(' and ')} {ineligible.length === 1 ? 'has' : 'have'} too
-                 little usable history to evaluate yet.</>
-              : 'all devices are evaluated.'}{' '}
-            The rows below therefore <b>do not sum to the plant total</b>, and no
-            figure here has been scaled up to cover the missing devices.
-          </InfoPanel>
+              not in a footnote after them — and only once there ARE numbers,
+              because "covers 0 of 12" above an empty table is noise. */}
+          {invRows.length > 0 && (
+            <InfoPanel tone="amber" className="mb-3"
+              title="This is a breakdown, not the plant forecast">
+              The official plant forecast is the one above, measured on all
+              twelve inverters' history. This table covers{' '}
+              <b>{eligible} of {invRows.length} inverters</b>
+              {ineligible.length > 0 && <>
+                {' '}— {ineligible.join(' and ')}{' '}
+                {ineligible.length === 1 ? 'has' : 'have'} too little usable
+                history to evaluate yet
+              </>}. The rows below therefore{' '}
+              <b>do not sum to the plant total</b>, and no figure here has been
+              scaled up to cover the devices that are missing from it.
+            </InfoPanel>
+          )}
 
           <div className="text-[11px] text-ge-text3 mb-2 leading-relaxed">
             Each inverter is backtested on its own history, and picks its own
@@ -328,9 +357,12 @@ export default function DeviceSection() {
           rows={rows}
           newestSeen={newest}
           emptyMsg={
-            tab === 'inverters' && !(forecasts?.devices || []).length
-              ? 'No device run yet. Use Run device forecasts.'
-              : 'No devices match this filter.'
+            tab !== 'inverters' ? 'No devices match this filter.'
+              : serverRunning
+                ? `Run in progress — ${invRows.length} of ${forecasts?.total || '?'} devices done. Each takes a few seconds; results appear as they finish.`
+                : invRows.length
+                  ? 'No devices match this filter.'
+                  : 'No device run yet. Use Run device forecasts. It takes a few minutes for twelve inverters.'
           }
         />
       )}
