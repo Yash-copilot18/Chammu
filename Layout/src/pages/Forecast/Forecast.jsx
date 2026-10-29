@@ -17,6 +17,7 @@ import {
   StatusBadge, InfoPanel, AlertCard, FactGrid,
 } from '../../components/Common'
 import { useApp } from '../../utils/AppContext'
+import DeviceSection from '../../components/Devices/DeviceSection'
 import {
   fetchForecastStatus, runForecast, fetchForecastLatest, fetchForecastNextDay,
   fetchForecastHistory, fetchForecastDeviations, reconcileForecast,
@@ -414,6 +415,10 @@ export default function Forecast() {
           {cov.timezone_note} {status?.data_freshness?.note}
         </div>
       </div>
+
+      {/* Device-wise forecasting, appended below everything above. Nothing
+          already on this page is moved, removed or restyled by it. */}
+      <DeviceSection />
     </div>
   )
 }

@@ -241,6 +241,11 @@ else:
 try:
     from app.routers import forecast
     app.include_router(forecast.router, prefix="/api/v1")
+    # Device-wise forecasting shares the same numeric stack, so it lives behind
+    # the same guard. Registered after the plant router and entirely separate
+    # from it: nothing here can change how the plant forecast behaves.
+    from app.routers import devices as devices_router
+    app.include_router(devices_router.router, prefix="/api/v1")
 except ImportError as exc:                       # noqa: BLE001 - startup must survive
     logger.warning(
         "Forecasting is DISABLED - %s. Every other endpoint is unaffected. "

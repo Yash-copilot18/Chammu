@@ -583,3 +583,21 @@ export const fetchDBHealth  = () => api.get('/db-test')
 export const fetchPlantInfo = () => api.get('/health')
 
 export default api
+// ── Device-wise forecasting ────────────────────────────────────────────────
+// Appended below the plant forecast calls; none of those are altered. The
+// device runs scan every inverter or all 170 combiner tables, so they carry
+// `timeout: 0` like the plant run rather than the client's 30s default.
+export const fetchDeviceInventory = () =>
+  api.get('/api/v1/devices/inventory', { timeout: 0 })
+
+export const fetchDeviceForecasts = () =>
+  api.get('/api/v1/devices/forecast', { timeout: 0 })
+
+export const runDeviceForecasts = () =>
+  api.post('/api/v1/devices/forecast', null, { timeout: 0 })
+
+export const fetchCombiners = () =>
+  api.get('/api/v1/devices/combiners', { timeout: 0 })
+
+export const fetchDeviceMeters = () =>
+  api.get('/api/v1/devices/meters', { timeout: 0 })
