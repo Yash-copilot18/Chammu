@@ -34,6 +34,7 @@ from app.forecast import backtest as BT
 from app.forecast import devices as D
 from app.forecast import features as F
 from app.forecast import models as M
+from app.forecast import service as S
 
 logger = logging.getLogger(__name__)
 
@@ -94,14 +95,16 @@ def _forecast_one(plant_rows: List[Dict[str, Any]], device: Dict[str, Any]
     test = bt["test"]
     n_test = int(test.get("n") or 0)
 
-    # One step past the last observed day, from a model refit on everything.
-    # Tomorrow's feature vector has to be BUILT: the last row of X predicts the
-    # last observed day, not the day after it.
-    model = M.fit_model(bt["selected_model"], frame["X"], frame["y"])
-    nxt = _next_day_value(frame, plant_rows, model)
-
     interval = BT.conformal_interval(bt["test_records"])
     half = (interval or {}).get("half_width_mwh")
+
+    # The forward series comes from the PLANT's own recursion, called directly
+    # rather than reimplemented here. One implementation means a device horizon
+    # and the plant horizon cannot drift apart, and it inherits the same
+    # property that matters: each step feeds its own output back as the next
+    # lag, so nothing from the future enters at any horizon.
+    forward = S._predict_forward(frame, bt, plant_rows, interval)
+    nxt = forward[0]["predicted_mwh"] if forward else 0.0
 
     # Sample size decides the badge, never the score. A high number on a
     # handful of days is not a measurement.
@@ -131,31 +134,67 @@ def _forecast_one(plant_rows: List[Dict[str, Any]], device: Dict[str, Any]
         "n_test": n_test,
         "test_start": bt["test_start"], "test_end": bt["test_end"],
         "leaderboard": bt["leaderboard"],
+        "horizons": _horizons(forward, n_test),
+        "daily": [{"date": p["date"], "horizon": p["horizon"],
+                   "predicted_mwh": round(p["predicted_mwh"], 2),
+                   "lower_mwh": round(p["lower_mwh"], 2) if p["lower_mwh"] else None,
+                   "upper_mwh": round(p["upper_mwh"], 2) if p["upper_mwh"] else None}
+                  for p in forward],
     }
 
 
-def _next_day_value(frame, rows, model) -> float:
-    """Tomorrow's features, built from the series the way build_frame builds them."""
-    import numpy as np
-    from datetime import timedelta
+# Horizon blocks exposed per device. Day 1 is the product; the rest are
+# planning volumes, and the labels below say which is which.
+HORIZON_BLOCKS = {"next_day": 1, "next_7_days": 7, "next_30_days": 30}
 
-    y = [float(r["energy_net_mwh"]) for r in rows]
-    last = rows[-1]
-    d = last["d"] + timedelta(days=1)
-    doy = d.timetuple().tm_yday
-    hist = np.array(y[-7:], dtype=float)
-    feats = [
-        y[-1], y[-2], y[-3], y[-7],
-        float(np.mean(y[-3:])), float(np.mean(hist)), float(np.std(hist)),
-        float(np.sin(2 * np.pi * doy / 365.25)),
-        float(np.cos(2 * np.pi * doy / 365.25)),
-        float(d.weekday()),
-        float(last["curtailed_minutes"]), float(last["avg_inverters_running"]),
-    ]
-    width = frame["X"].shape[1]
-    while len(feats) < width:
-        feats.append(float(frame["X"][-1][len(feats)]))
-    return float(M.predict(model, np.array([feats[:width]], dtype=float))[0])
+
+def _horizons(forward: List[Dict[str, Any]], n_test: int) -> Dict[str, Any]:
+    """
+    Cumulative totals per horizon, each carrying what the backtest knows.
+
+    Only horizon 1 is measured. Beyond it the model consumes its own output
+    with no new information entering, so the series decays toward the device's
+    recent average - useful as a planning volume, not a forecast, and labelled
+    that way rather than left for the reader to infer.
+    """
+    out: Dict[str, Any] = {}
+    for label, days in HORIZON_BLOCKS.items():
+        take = forward[:days]
+        have = len(take)
+        total = sum(p["predicted_mwh"] for p in take)
+        lo = [p["lower_mwh"] for p in take]
+        hi = [p["upper_mwh"] for p in take]
+        measured = days == 1 and n_test >= BT.MIN_CREDIBLE_TEST_DAYS
+        out[label] = {
+            "days_requested": days,
+            "days_available": have,
+            "complete": have >= days,
+            "total_mwh": round(total, 2) if have else None,
+            "mean_daily_mwh": round(total / have, 2) if have else None,
+            # Summing the daily bands assumes the errors move together. They do
+            # not, so this band is wider than the truth - erring toward
+            # overstating uncertainty rather than understating it.
+            "lower_mwh": round(sum(x for x in lo if x is not None), 2)
+                         if have and all(x is not None for x in lo) else None,
+            "upper_mwh": round(sum(x for x in hi if x is not None), 2)
+                         if have and all(x is not None for x in hi) else None,
+            "start": take[0]["date"] if have else None,
+            "end": take[-1]["date"] if have else None,
+            "validated": measured,
+            "label": ("MEASURED" if measured
+                      else "PROVISIONAL" if days == 1 else "PLANNING ESTIMATE"),
+            "basis": (
+                f"Measured by the day-ahead backtest on {n_test} held-out "
+                f"day{'' if n_test == 1 else 's'}."
+                + ("" if measured else " Below the "
+                   f"{BT.MIN_CREDIBLE_TEST_DAYS} needed to be stable.")
+                if days == 1 else
+                f"Not evaluated at this range. Each day after the first is "
+                f"predicted from the previous day's prediction with no new "
+                f"information entering, so the series settles toward this "
+                f"device's recent average. Use as an expected volume."),
+        }
+    return out
 
 
 def run_device_forecasts(db: Session) -> Dict[str, Any]:

@@ -107,6 +107,13 @@ export default function DeviceSection() {
   const newest = inventory?.inverters?.reduce(
     (a, d) => (!a || (d.last_seen && d.last_seen > a) ? d.last_seen : a), null)
 
+  // How much of the fleet the breakdown actually covers. Counted from the
+  // results rather than hard-coded, so it stays true as history accumulates
+  // and a device becomes evaluable.
+  const invRows = forecasts?.devices || []
+  const eligible = invRows.filter(r => r.n_test > 0).length
+  const ineligible = invRows.filter(r => !r.n_test).map(r => r.device)
+
   // ── rows for the active tab ───────────────────────────────────────────────
   const raw = tab === 'inverters' ? (forecasts?.devices || [])
     : tab === 'combiners' ? (combiners?.devices || [])
@@ -131,10 +138,16 @@ export default function DeviceSection() {
       render: r => r.model || <span className="text-ge-text3">—</span> },
     { key: 'latest_actual_mwh', label: 'Latest actual', align: 'right',
       render: r => val(r.latest_actual_mwh, 1) },
-    { key: 'predicted_mwh', label: 'Predicted', align: 'right',
+    { key: 'predicted_mwh', label: 'Next day', align: 'right',
       render: r => val(r.predicted_mwh, 1) },
     { key: 'forecast_date', label: 'For', sortable: false,
       render: r => shortDate(r.forecast_date) },
+    // Cumulative volumes. Deliberately not given a validation badge of their
+    // own: the column header says planning estimate once, for the pair.
+    { key: 'h7', label: 'Next 7 d', align: 'right', sortable: false,
+      render: r => val(r.horizons?.next_7_days?.total_mwh, 0) },
+    { key: 'h30', label: 'Next 30 d', align: 'right', sortable: false,
+      render: r => val(r.horizons?.next_30_days?.total_mwh, 0) },
     { key: 'score_pct', label: 'Score %', align: 'right',
       render: r => val(r.score_pct, 1) },
     { key: 'mae_mwh', label: 'MAE', align: 'right',
@@ -253,14 +266,35 @@ export default function DeviceSection() {
 
       {/* what this tab's numbers are worth */}
       {tab === 'inverters' && (
-        <div className="text-[11px] text-ge-text3 mb-2 leading-relaxed">
-          Each inverter is backtested on its own history, and picks its own model
-          from the same five candidates on identical chronological folds — the
-          plant's winner is not inherited. Per-device error is larger than the
-          plant's, because errors that cancel across twelve inverters do not
-          cancel within one. A negative R² means the model tracked that device's
-          day-to-day variation worse than its own average would have.
-        </div>
+        <>
+          {/* The one thing a reader must not do with this table is add it up
+              and call the result the plant forecast. Said before the numbers,
+              not in a footnote after them. */}
+          <InfoPanel tone="amber" className="mb-3"
+            title="This is a breakdown, not the plant forecast">
+            The official plant forecast is the one above, measured on all twelve
+            inverters' history. This table covers{' '}
+            <b>{eligible} of {counts.inverters ?? 12} inverters</b> —{' '}
+            {ineligible.length > 0
+              ? <>{ineligible.join(' and ')} {ineligible.length === 1 ? 'has' : 'have'} too
+                 little usable history to evaluate yet.</>
+              : 'all devices are evaluated.'}{' '}
+            The rows below therefore <b>do not sum to the plant total</b>, and no
+            figure here has been scaled up to cover the missing devices.
+          </InfoPanel>
+
+          <div className="text-[11px] text-ge-text3 mb-2 leading-relaxed">
+            Each inverter is backtested on its own history, and picks its own
+            model from the same five candidates on identical chronological folds
+            — the plant's winner is not inherited. Per-device error is larger
+            than the plant's, because errors that cancel across twelve inverters
+            do not cancel within one. A negative R² means the model tracked that
+            device's day-to-day variation worse than its own average would have.
+            {' '}<b>Next 7 d and Next 30 d are planning estimates</b>: only the
+            next-day figure is backtested, and beyond it each day is predicted
+            from the previous day's prediction with no new information entering.
+          </div>
+        </>
       )}
       {tab === 'combiners' && combiners && (
         <div className="text-[11px] text-ge-text3 mb-2 leading-relaxed">
