@@ -1,0 +1,7 @@
+# Binary files git must never touch: line-ending conversion corrupts them.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff  binary
+*.woff2 binary
