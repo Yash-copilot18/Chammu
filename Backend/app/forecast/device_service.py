@@ -23,8 +23,10 @@ was out of scope. They are lost on restart and recomputed on demand.
 from __future__ import annotations
 
 import logging
+import os
 import statistics
 import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -198,8 +200,61 @@ def _horizons(forward: List[Dict[str, Any]], n_test: int) -> Dict[str, Any]:
     return out
 
 
+def _worker_init() -> None:
+    """
+    Pin each worker to one thread.
+
+    The forest and the booster are built with n_jobs=-1, which is right when one
+    device is fitted at a time but wrong once twelve are fitted at once: every
+    worker would start a thread per core and the machine would spend its time
+    context-switching between 144 of them. One thread per worker, many workers,
+    is faster than the reverse and gives identical numbers either way.
+    """
+    for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS"):
+        os.environ[var] = "1"
+
+
+def _worker_count(n_devices: int) -> int:
+    """
+    How many devices to fit at once.
+
+    Unset or 0 means automatic. 1 forces the original serial path, which is the
+    escape hatch if a machine ever misbehaves under the pool.
+    """
+    want = 0
+    raw = os.getenv("DEVICE_FORECAST_WORKERS", "").strip()
+    if raw:
+        try:
+            want = int(raw)
+        except ValueError:
+            logger.warning("DEVICE_FORECAST_WORKERS=%r is not a number; "
+                           "using automatic instead.", raw)
+            want = 0
+        if want == 1:
+            return 1
+    if want <= 0:
+        # Leave one core for the server itself, so the API keeps answering
+        # while a run is in progress.
+        want = max(1, (os.cpu_count() or 2) - 1)
+    return max(1, min(want, n_devices))
+
+
 def run_device_forecasts(db: Session) -> Dict[str, Any]:
-    """Forecast every discovered inverter. Slow enough to be button-driven."""
+    """
+    Forecast every discovered inverter.
+
+    The SQL is cheap (about a fifth of a second per device) and the model
+    fitting is not: each device fits all five candidates across every fold, so
+    even a device that ends up choosing Persistence pays for the forest and the
+    booster first. Those fits share nothing - no session, no state, one device's
+    history each - so they are run in parallel across processes.
+
+    The arithmetic is untouched. Each device sees exactly the data it saw
+    before, the models carry fixed seeds, and the rows are re-ordered back into
+    discovery order before they are published, so the output is identical to the
+    serial run; only the waiting is shorter.
+    """
     with _lock:
         if _forecast_cache.get("running"):
             return {"ok": False, "reason": "A device run is already in progress."}
@@ -208,23 +263,55 @@ def run_device_forecasts(db: Session) -> Dict[str, Any]:
         inv = D.discover(db)["inverters"]
         fresh = D.last_seen(db, [d["table"] for d in inv])
         with _lock:
-            # Clear previous results at the start. A run takes minutes, and
+            # Clear previous results at the start. A run takes a while, and
             # leaving the old rows in place while it works makes the progress
             # count read as "11 of 12 done" from the first second.
             _forecast_cache["devices"] = []
             _forecast_cache["total"] = len(inv)
-        out = []
-        for device in inv:
-            rows = D.daily_inverter(db, device["table"])
-            row = _forecast_one(rows, device)
+
+        # Read every device's history up front, on this thread. The database
+        # work is serial either way and a worker process has no session.
+        work = [(device, D.daily_inverter(db, device["table"])) for device in inv]
+
+        done: Dict[str, Dict[str, Any]] = {}
+
+        def _publish(device: Dict[str, Any], row: Dict[str, Any]) -> None:
+            """Record one finished device and republish in discovery order."""
             row["last_seen"] = fresh.get(device["table"])
-            out.append(row)
-            # Published as each device finishes, so the UI can show real
-            # progress rather than a spinner with nothing behind it.
+            done[device["id"]] = row
+            ordered = [done[d["id"]] for d, _ in work if d["id"] in done]
             with _lock:
-                _forecast_cache["devices"] = list(out)
+                _forecast_cache["devices"] = ordered
             logger.info("device forecast %s: %s (%s complete days)",
                         device["id"], row["status"], row["complete_days"])
+
+        workers = _worker_count(len(work))
+        ran_parallel = False
+        if workers > 1:
+            try:
+                with ProcessPoolExecutor(max_workers=workers,
+                                         initializer=_worker_init) as pool:
+                    futures = {pool.submit(_forecast_one, rows, device): device
+                               for device, rows in work}
+                    for future in as_completed(futures):
+                        device = futures[future]
+                        _publish(device, future.result())
+                ran_parallel = True
+                logger.info("device forecasts fitted across %d workers", workers)
+            except Exception as exc:  # noqa: BLE001
+                # A machine that cannot spawn processes - a locked-down host, a
+                # frozen build - must still produce the forecast, just slower.
+                # Anything already published is discarded so the serial pass is
+                # the only thing that can reach the cache.
+                logger.warning("Parallel device run unavailable (%s). "
+                               "Falling back to one device at a time.", exc)
+                done.clear()
+
+        if not ran_parallel:
+            for device, rows in work:
+                _publish(device, _forecast_one(rows, device))
+
+        out = [done[device["id"]] for device, _ in work]
         result = {"ok": True, "generated_at": datetime.now(),
                   "devices": out, "n_devices": len(out)}
         with _lock:
