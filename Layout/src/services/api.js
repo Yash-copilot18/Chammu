@@ -554,8 +554,11 @@ export const fetchForecastLatest = () =>
 export const fetchForecastNextDay = () =>
   api.get('/api/v1/forecast/next-day', { timeout: 0 })
 
-export const fetchForecastHistory = (limit = 120) =>
-  api.get('/api/v1/forecast/history', { params: { limit }, timeout: 0 })
+// `bucket` is 'day' | 'week' | 'month'. 'day' is the original series and the
+// original payload; the other two are that same series summed into calendar
+// periods server-side, so a week can never disagree with the days inside it.
+export const fetchForecastHistory = (limit = 120, bucket = 'day') =>
+  api.get('/api/v1/forecast/history', { params: { limit, bucket }, timeout: 0 })
 
 export const fetchForecastDeviations = (onlyAlerts = true, limit = 50) =>
   api.get('/api/v1/forecast/deviations', {
