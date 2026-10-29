@@ -56,7 +56,7 @@ function PeriodTooltip({ active, payload, label, bucket }) {
     ['Predicted', payload.find(p => p.dataKey === 'predicted')?.value, m?.days_with_predicted],
   ]
   return (
-    <div className="bg-[#121a26] border border-[#243043] px-2.5 py-2 text-[11px]">
+    <div className="bg-[#191a1d] border border-[#2e2f32] px-2.5 py-2 text-[11px]">
       <div className="text-ge-text1 font-medium mb-1">{label}</div>
       {rows.map(([name, value, days]) => (
         <div key={name} className="flex gap-2 justify-between">
@@ -366,11 +366,11 @@ export default function Forecast() {
           <div className="h-72">
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart data={chart} margin={{ top: 8, right: 16, bottom: 4, left: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#243043" />
-                <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#7d8da3' }} />
-                <YAxis tick={{ fontSize: 10, fill: '#7d8da3' }}
+                <CartesianGrid strokeDasharray="3 3" stroke="#2e2f32" />
+                <XAxis dataKey="date" tick={{ fontSize: 10, fill: '#8b8c8f' }} />
+                <YAxis tick={{ fontSize: 10, fill: '#8b8c8f' }}
                        label={{ value: BUCKET.unit, angle: -90, position: 'insideLeft',
-                                fill: '#7d8da3', fontSize: 10 }} />
+                                fill: '#8b8c8f', fontSize: 10 }} />
                 <Tooltip content={<PeriodTooltip bucket={bucket} />} />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
                 <Area dataKey="band" name="Prediction interval" stroke="none"
@@ -379,7 +379,7 @@ export default function Forecast() {
                       dot={false} connectNulls={false} />
                 <Line dataKey="predicted" name="Predicted" stroke="#f59e0b"
                       strokeWidth={2} strokeDasharray="4 3" dot={false} />
-                <ReferenceLine y={0} stroke="#334155" />
+                <ReferenceLine y={0} stroke="#3f4043" />
               </ComposedChart>
             </ResponsiveContainer>
           </div>

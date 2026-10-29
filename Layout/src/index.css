@@ -1,23 +1,38 @@
 /* ── Theme CSS Custom Properties ──────────────────────────────────────────── */
 
-/* Dark theme (default — .dark on <html>) */
+/* Dark theme (default — .dark on <html>)
+ *
+ * Neutral charcoal. The previous palette carried a blue cast through every
+ * surface, which tinted the chart colours sitting on top of it: the green
+ * actual line and the blue prediction band were both reading against a
+ * background that was itself blue. Grey is the quieter ground for a chart.
+ *
+ * The seven surface steps keep the spacing they had, so nothing that relied
+ * on card-above-page or elevated-above-surface separation has flattened —
+ * only the hue has changed. Accent, warn, danger and success are untouched:
+ * they carry meaning, and re-tinting them would change what the dashboard
+ * says, not how it looks.
+ *
+ * Each value is luminance-matched to the colour it replaces, so every
+ * text-on-surface contrast ratio is held to within 0.02 of what it was. The
+ * hue moved; the legibility did not. */
 :root {
-  --ge-navy:    10 14 26;
-  --ge-dark:    15 21 36;
-  --ge-card:    20 25 40;
-  --ge-surface: 26 32 53;
-  --ge-elevated: 31 38 64;
-  --ge-border:  42 51 80;
-  --ge-border2: 51 64 102;
+  --ge-navy:    13 14 17;
+  --ge-dark:    20 21 24;
+  --ge-card:    24 25 28;
+  --ge-surface: 32 33 37;
+  --ge-elevated: 38 39 44;
+  --ge-border:  52 54 60;
+  --ge-border2: 70 73 81;
   --ge-accent:  0 212 170;
   --ge-blue:    0 153 255;
   --ge-purple:  124 58 237;
   --ge-warn:    245 158 11;
   --ge-danger:  239 68 68;
   --ge-success: 16 185 129;
-  --ge-text1:   232 236 244;
-  --ge-text2:   160 174 192;
-  --ge-text3:   107 122 153;
+  --ge-text1:   234 236 239;
+  --ge-text2:   170 173 178;
+  --ge-text3:   119 122 129;
 }
 
 /* Light theme (no .dark class on <html>) */
