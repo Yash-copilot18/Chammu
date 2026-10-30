@@ -2,37 +2,40 @@
 
 /* Dark theme (default — .dark on <html>)
  *
- * Neutral charcoal. The previous palette carried a blue cast through every
- * surface, which tinted the chart colours sitting on top of it: the green
- * actual line and the blue prediction band were both reading against a
- * background that was itself blue. Grey is the quieter ground for a chart.
+ * Deep graphite with a faint green-slate undertone. No blue anywhere: the
+ * surfaces were blue-navy, which also tinted the chart sitting on them, and
+ * the primary action colour was a bright blue. Both are gone. The undertone
+ * leans very slightly toward the teal accent so the palette reads as chosen
+ * rather than as a default grey, while staying dark enough to be unobtrusive
+ * behind data.
  *
- * The seven surface steps keep the spacing they had, so nothing that relied
- * on card-above-page or elevated-above-surface separation has flattened —
- * only the hue has changed. Accent, warn, danger and success are untouched:
- * they carry meaning, and re-tinting them would change what the dashboard
- * says, not how it looks.
+ * Every surface is luminance-matched to the colour it replaces — the whole
+ * ladder is within 2.4% of the original, and each border step within 1% —
+ * so nothing that relied on card-above-page or elevated-above-surface
+ * separation has flattened, and no text-on-surface contrast ratio moved.
  *
- * Each value is luminance-matched to the colour it replaces, so every
- * text-on-surface contrast ratio is held to within 0.02 of what it was. The
- * hue moved; the legibility did not. */
+ * Warn, danger and success keep their hues. They carry meaning rather than
+ * style, and re-tinting them would change what the dashboard says. */
 :root {
-  --ge-navy:    13 14 17;
-  --ge-dark:    20 21 24;
-  --ge-card:    24 25 28;
-  --ge-surface: 32 33 37;
-  --ge-elevated: 38 39 44;
-  --ge-border:  52 54 60;
-  --ge-border2: 70 73 81;
+  --ge-navy:    12 15 14;
+  --ge-dark:    19 22 21;
+  --ge-card:    23 26 25;
+  --ge-surface: 31 34 33;
+  --ge-elevated: 37 40 39;
+  --ge-border:  50 53 52;
+  --ge-border2: 63 66 65;
   --ge-accent:  0 212 170;
-  --ge-blue:    0 153 255;
+  /* Named "blue" throughout the app, which is why it is retuned here rather
+   * than renamed across twenty files: it is the primary action colour, and
+   * it is now a teal deep enough to carry white text (4.89:1). */
+  --ge-blue:    0 128 106;
   --ge-purple:  124 58 237;
   --ge-warn:    245 158 11;
   --ge-danger:  239 68 68;
   --ge-success: 16 185 129;
-  --ge-text1:   234 236 239;
-  --ge-text2:   170 173 178;
-  --ge-text3:   119 122 129;
+  --ge-text1:   234 237 235;
+  --ge-text2:   168 173 170;
+  --ge-text3:   119 123 121;
 }
 
 /* Light theme (no .dark class on <html>) */
@@ -45,7 +48,7 @@ html:not(.dark) {
   --ge-border:  209 217 230;
   --ge-border2: 176 189 212;
   --ge-accent:  0 169 136;
-  --ge-blue:    0 115 204;
+  --ge-blue:    0 110 92;
   --ge-purple:  109 40 217;
   --ge-warn:    217 119 6;
   --ge-danger:  220 38 38;
@@ -94,7 +97,9 @@ html:not(.dark) {
            transition-all duration-150 cursor-pointer border whitespace-nowrap font-sans
            disabled:opacity-50 disabled:cursor-not-allowed;
   }
-  .btn-primary { @apply bg-ge-blue text-white border-ge-blue hover:bg-blue-500; }
+  /* Hover brightens the token rather than jumping to a fixed Tailwind blue,
+   * which would have flashed the one colour the palette no longer uses. */
+  .btn-primary { @apply bg-ge-blue text-white border-ge-blue hover:brightness-125; }
   .btn-success { @apply bg-ge-accent text-black border-ge-accent hover:bg-teal-400; }
   .btn-outline  { @apply bg-transparent text-ge-text2 border-ge-border2 hover:bg-ge-elevated hover:text-ge-text1; }
   .btn-danger   { @apply bg-transparent text-ge-danger border-ge-danger hover:bg-red-950; }

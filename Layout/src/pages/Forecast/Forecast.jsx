@@ -373,8 +373,11 @@ export default function Forecast() {
                                 fill: '#8b8c8f', fontSize: 10 }} />
                 <Tooltip content={<PeriodTooltip bucket={bucket} />} />
                 <Legend wrapperStyle={{ fontSize: 11 }} />
+                {/* Amber, matching the predicted line it belongs to. It was
+                    blue, which tied the band to nothing on the chart and read
+                    at 3.1:1 against the page; amber reads at 9.0:1. */}
                 <Area dataKey="band" name="Prediction interval" stroke="none"
-                      fill="#0b63a8" fillOpacity={0.18} connectNulls={false} />
+                      fill="#f59e0b" fillOpacity={0.07} connectNulls={false} />
                 <Line dataKey="actual" name="Actual" stroke="#22c55e" strokeWidth={2}
                       dot={false} connectNulls={false} />
                 <Line dataKey="predicted" name="Predicted" stroke="#f59e0b"

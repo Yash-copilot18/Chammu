@@ -58,7 +58,7 @@ export default function Header() {
         >
           <div
             className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-semibold text-white flex-shrink-0"
-            style={{ background: 'linear-gradient(135deg,#0099ff,#7c3aed)' }}
+            style={{ background: 'linear-gradient(135deg,#00806a,#0f766e)' }}
           >
             {userProfile.initials}
           </div>
